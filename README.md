@@ -173,17 +173,10 @@ ClawGuard/
 │   ├── openclaw.plugin.json    # Plugin manifest
 │   └── SKILL.md                # Agent skill definition
 ├── bin/
-│   ├── enable-clawguard.sh     # Enable + start
-│   ├── disable-clawguard.sh    # Disable + restore
-│   └── clawguard-shell         # Shell wrapper
-├── tests/
-│   ├── test_*.py               # Unit tests
-│   └── transform.js            # OpenClaw config transform tool
-└── docs/
-    ├── USER_GUIDE.md
-    ├── QUICK_START.md
-    ├── SECURITY_ANALYSIS.md
-    └── CLAWGUARD_TRANSFORM.md
+    ├── enable-clawguard.sh     # Enable + start
+    ├── disable-clawguard.sh    # Disable + restore
+    └── clawguard-shell         # Shell wrapper
+
 ```
 
 ---
