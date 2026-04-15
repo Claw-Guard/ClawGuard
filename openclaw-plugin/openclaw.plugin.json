@@ -1,0 +1,35 @@
+{
+  "id": "clawguard",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "daemonHost": {
+        "type": "string",
+        "default": "127.0.0.1",
+        "description": "ClawGuard daemon host"
+      },
+      "daemonPort": {
+        "type": "integer",
+        "default": 19821,
+        "description": "ClawGuard daemon dashboard port"
+      },
+      "healthCheckInterval": {
+        "type": "integer",
+        "default": 30,
+        "description": "Health check interval in seconds"
+      },
+      "autoReconnect": {
+        "type": "boolean",
+        "default": true,
+        "description": "Auto reconnect to daemon on failure"
+      }
+    }
+  },
+  "uiHints": {
+    "daemonHost": { "label": "Daemon Host", "placeholder": "127.0.0.1" },
+    "daemonPort": { "label": "Dashboard Port", "placeholder": "19821" },
+    "healthCheckInterval": { "label": "Health Check Interval (seconds)", "placeholder": "30" },
+    "autoReconnect": { "label": "Auto Reconnect" }
+  }
+}

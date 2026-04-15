@@ -1,0 +1,148 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ClawGuard Dashboard</title>
+    <link rel="stylesheet" href="/static/css/style.css">
+</head>
+<body>
+    <div class="container">
+        <!-- Header -->
+        <header class="header">
+            <div class="logo">
+                <span class="logo-icon">🛡️</span>
+                <h1>ClawGuard</h1>
+            </div>
+            <div class="status-badge" id="status-badge">
+                <span class="status-dot"></span>
+                <span class="status-text">Checking...</span>
+            </div>
+        </header>
+
+        <!-- Panic Banner -->
+        <div class="panic-banner hidden" id="panic-banner">
+            <div class="panic-content">
+                <span class="panic-icon">🚨</span>
+                <div class="panic-info">
+                    <h2>PANIC MODE ACTIVE</h2>
+                    <p id="panic-reason">All agent operations are blocked</p>
+                </div>
+                <button class="btn btn-resume" id="btn-resume">Resume</button>
+            </div>
+        </div>
+
+        <!-- Main Grid -->
+        <div class="grid">
+            <!-- Stats Cards -->
+            <div class="card">
+                <div class="card-header">
+                    <h3>📊 Statistics (24h)</h3>
+                </div>
+                <div class="card-body">
+                    <div class="stat-row">
+                        <span class="stat-label">Total Operations</span>
+                        <span class="stat-value" id="stat-total">0</span>
+                    </div>
+                    <div class="stat-row">
+                        <span class="stat-label">Blocked</span>
+                        <span class="stat-value stat-danger" id="stat-blocked">0</span>
+                    </div>
+                    <div class="stat-row">
+                        <span class="stat-label">Approved</span>
+                        <span class="stat-value stat-success" id="stat-approved">0</span>
+                    </div>
+                    <div class="stat-row">
+                        <span class="stat-label">Denied</span>
+                        <span class="stat-value stat-warning" id="stat-denied">0</span>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Panic Control -->
+            <div class="card">
+                <div class="card-header">
+                    <h3>🚨 Emergency Control</h3>
+                </div>
+                <div class="card-body panic-control">
+                    <p>Instantly block all agent operations</p>
+                    <div class="panic-form">
+                        <input type="text" id="panic-reason-input" placeholder="Reason for panic (optional)">
+                        <button class="btn btn-danger" id="btn-panic">🚨 PANIC</button>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Approval Queue -->
+            <div class="card card-wide">
+                <div class="card-header">
+                    <h3>📋 Approval Queue</h3>
+                    <span class="badge" id="queue-count">0</span>
+                </div>
+                <div class="card-body">
+                    <div class="approval-list" id="approval-list">
+                        <p class="empty-message">No pending approvals</p>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Audit Log -->
+            <div class="card card-wide">
+                <div class="card-header">
+                    <h3>📜 Audit Log</h3>
+                    <button class="btn btn-small" id="btn-refresh-log">Refresh</button>
+                </div>
+                <div class="card-body">
+                    <div class="log-table-container">
+                        <table class="log-table">
+                            <thead>
+                                <tr>
+                                    <th>Time</th>
+                                    <th>Action</th>
+                                    <th>Result</th>
+                                    <th>Operation</th>
+                                    <th>Reason</th>
+                                </tr>
+                            </thead>
+                            <tbody id="audit-log-body">
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Sanitizer Test -->
+            <div class="card">
+                <div class="card-header">
+                    <h3>🔐 Sanitizer Test</h3>
+                </div>
+                <div class="card-body">
+                    <textarea id="sanitize-input" placeholder="Enter text to sanitize..."></textarea>
+                    <button class="btn btn-primary" id="btn-sanitize">Sanitize</button>
+                    <div class="sanitize-result hidden" id="sanitize-result">
+                        <h4>Result:</h4>
+                        <pre id="sanitize-output"></pre>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Command Checker -->
+            <div class="card">
+                <div class="card-header">
+                    <h3>⚡ Command Checker</h3>
+                </div>
+                <div class="card-body">
+                    <input type="text" id="command-input" placeholder="Enter command to check...">
+                    <button class="btn btn-primary" id="btn-check-command">Check</button>
+                    <div class="check-result hidden" id="check-result">
+                        <div class="result-badge" id="result-badge"></div>
+                        <p id="check-reason"></p>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script src="/static/js/app.js"></script>
+</body>
+</html>

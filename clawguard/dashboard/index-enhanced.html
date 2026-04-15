@@ -1,0 +1,387 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ClawGuard Dashboard - Enhanced</title>
+    <link rel="stylesheet" href="/static/css/style.css">
+    <style>
+        /* Additional styles for rule management */
+        .tabs {
+            display: flex;
+            border-bottom: 2px solid #e1e8ed;
+            margin-bottom: 1rem;
+        }
+        .tab {
+            padding: 0.75rem 1.5rem;
+            cursor: pointer;
+            border: none;
+            background: transparent;
+            font-size: 1rem;
+            color: #657786;
+            transition: all 0.2s;
+        }
+        .tab:hover {
+            color: #1da1f2;
+        }
+        .tab.active {
+            color: #1da1f2;
+            border-bottom: 2px solid #1da1f2;
+            margin-bottom: -2px;
+        }
+        .tab-content {
+            display: none;
+        }
+        .tab-content.active {
+            display: block;
+        }
+        .rule-list {
+            max-height: 400px;
+            overflow-y: auto;
+        }
+        .rule-item {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 0.5rem;
+            border-bottom: 1px solid #e1e8ed;
+        }
+        .rule-item:last-child {
+            border-bottom: none;
+        }
+        .rule-text {
+            flex: 1;
+            font-family: 'Courier New', monospace;
+            font-size: 0.9rem;
+        }
+        .btn-remove {
+            background: #e0245e;
+            color: white;
+            border: none;
+            padding: 0.25rem 0.75rem;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 0.85rem;
+        }
+        .btn-remove:hover {
+            background: #c91c4d;
+        }
+        .add-rule-form {
+            display: flex;
+            gap: 0.5rem;
+            margin-bottom: 1rem;
+        }
+        .add-rule-form input {
+            flex: 1;
+        }
+        .empty-list {
+            text-align: center;
+            color: #657786;
+            padding: 2rem;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <!-- Header -->
+        <header class="header">
+            <div class="logo">
+                <span class="logo-icon">🛡️</span>
+                <h1>ClawGuard</h1>
+            </div>
+            <div class="status-badge" id="status-badge">
+                <span class="status-dot"></span>
+                <span class="status-text">Checking...</span>
+            </div>
+        </header>
+
+        <!-- Panic Banner -->
+        <div class="panic-banner hidden" id="panic-banner">
+            <div class="panic-content">
+                <span class="panic-icon">🚨</span>
+                <div class="panic-info">
+                    <h2>PANIC MODE ACTIVE</h2>
+                    <p id="panic-reason">All agent operations are blocked</p>
+                </div>
+                <button class="btn btn-resume" id="btn-resume">Resume</button>
+            </div>
+        </div>
+
+        <!-- Tab Navigation -->
+        <div class="tabs">
+            <button class="tab active" data-tab="dashboard">📊 Dashboard</button>
+            <button class="tab" data-tab="rules">🛠️ Rule Management</button>
+            <button class="tab" data-tab="testing">🧪 Testing</button>
+        </div>
+
+        <!-- Dashboard Tab -->
+        <div class="tab-content active" id="dashboard-tab">
+            <div class="grid">
+                <!-- Stats Cards -->
+                <div class="card">
+                    <div class="card-header">
+                        <h3>📊 Statistics (24h)</h3>
+                    </div>
+                    <div class="card-body">
+                        <div class="stat-row">
+                            <span class="stat-label">Total Operations</span>
+                            <span class="stat-value" id="stat-total">0</span>
+                        </div>
+                        <div class="stat-row">
+                            <span class="stat-label">Blocked</span>
+                            <span class="stat-value stat-danger" id="stat-blocked">0</span>
+                        </div>
+                        <div class="stat-row">
+                            <span class="stat-label">Approved</span>
+                            <span class="stat-value stat-success" id="stat-approved">0</span>
+                        </div>
+                        <div class="stat-row">
+                            <span class="stat-label">Denied</span>
+                            <span class="stat-value stat-warning" id="stat-denied">0</span>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Panic Control -->
+                <div class="card">
+                    <div class="card-header">
+                        <h3>🚨 Emergency Control</h3>
+                    </div>
+                    <div class="card-body panic-control">
+                        <p>Instantly block all agent operations</p>
+                        <div class="panic-form">
+                            <input type="text" id="panic-reason-input" placeholder="Reason for panic (optional)">
+                            <button class="btn btn-danger" id="btn-panic">🚨 PANIC</button>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Approval Queue -->
+                <div class="card card-wide">
+                    <div class="card-header">
+                        <h3>📋 Approval Queue</h3>
+                        <span class="badge" id="queue-count">0</span>
+                    </div>
+                    <div class="card-body">
+                        <div class="approval-list" id="approval-list">
+                            <p class="empty-message">No pending approvals</p>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Audit Log -->
+                <div class="card card-wide">
+                    <div class="card-header">
+                        <h3>📜 Audit Log</h3>
+                        <div style="display: flex; gap: 0.5rem;">
+                            <button class="btn btn-small" id="btn-refresh-log">Refresh</button>
+                            <button class="btn btn-small" id="btn-download-log">📥 Download JSON</button>
+                        </div>
+                    </div>
+                    <div class="card-body">
+                        <!-- Download Filter Section -->
+                        <div style="background: #f7f9fa; padding: 1rem; border-radius: 8px; margin-bottom: 1rem;">
+                            <h4 style="margin: 0 0 0.75rem 0; font-size: 0.9rem; color: #657786;">Download Filters</h4>
+                            <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 0.75rem;">
+                                <div>
+                                    <label style="display: block; font-size: 0.85rem; margin-bottom: 0.25rem;">Start Date/Time</label>
+                                    <input type="datetime-local" id="download-start-time" style="width: 100%; padding: 0.5rem; border: 1px solid #e1e8ed; border-radius: 4px;">
+                                </div>
+                                <div>
+                                    <label style="display: block; font-size: 0.85rem; margin-bottom: 0.25rem;">End Date/Time</label>
+                                    <input type="datetime-local" id="download-end-time" style="width: 100%; padding: 0.5rem; border: 1px solid #e1e8ed; border-radius: 4px;">
+                                </div>
+                                <div>
+                                    <label style="display: block; font-size: 0.85rem; margin-bottom: 0.25rem;">Action Type</label>
+                                    <select id="download-action" style="width: 100%; padding: 0.5rem; border: 1px solid #e1e8ed; border-radius: 4px;">
+                                        <option value="">All Actions</option>
+                                        <option value="command_exec">Command Exec</option>
+                                        <option value="file_read">File Read</option>
+                                        <option value="file_write">File Write</option>
+                                        <option value="network_request">Network Request</option>
+                                        <option value="skill_check">Skill Check</option>
+                                        <option value="panic_trigger">Panic Trigger</option>
+                                        <option value="approval_approve">Approval Approve</option>
+                                        <option value="approval_deny">Approval Deny</option>
+                                        <option value="rule_deny">Rule Deny</option>
+                                    </select>
+                                </div>
+                                <div>
+                                    <label style="display: block; font-size: 0.85rem; margin-bottom: 0.25rem;">Result</label>
+                                    <select id="download-result" style="width: 100%; padding: 0.5rem; border: 1px solid #e1e8ed; border-radius: 4px;">
+                                        <option value="">All Results</option>
+                                        <option value="allowed">Allowed</option>
+                                        <option value="denied">Denied</option>
+                                        <option value="approved">Approved</option>
+                                        <option value="pending">Pending</option>
+                                        <option value="error">Error</option>
+                                    </select>
+                                </div>
+                            </div>
+                            <div style="margin-top: 0.75rem;">
+                                <button class="btn btn-small" id="btn-download-filtered" style="background: #1da1f2;">📥 Download Filtered Logs</button>
+                                <button class="btn btn-small" id="btn-clear-filters" style="background: #657786;">Clear Filters</button>
+                            </div>
+                        </div>
+                        
+                        <div class="log-table-container">
+                            <table class="log-table">
+                                <thead>
+                                    <tr>
+                                        <th>Time</th>
+                                        <th>Action</th>
+                                        <th>Result</th>
+                                        <th>Operation</th>
+                                        <th>Reason</th>
+                                    </tr>
+                                </thead>
+                                <tbody id="audit-log-body">
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Rule Management Tab -->
+        <div class="tab-content" id="rules-tab">
+            <div class="grid">
+                <!-- Network Rules -->
+                <div class="card">
+                    <div class="card-header">
+                        <h3>🌐 Allowed Websites</h3>
+                    </div>
+                    <div class="card-body">
+                        <div class="add-rule-form">
+                            <input type="text" id="network-allow-input" placeholder="e.g., api.github.com">
+                            <button class="btn btn-primary" id="btn-add-network-allow">Add</button>
+                        </div>
+                        <div class="rule-list" id="network-allow-list">
+                            <p class="empty-list">Loading...</p>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Network Denied -->
+                <div class="card">
+                    <div class="card-header">
+                        <h3>🚫 Blocked Websites</h3>
+                    </div>
+                    <div class="card-body">
+                        <div class="add-rule-form">
+                            <input type="text" id="network-deny-input" placeholder="e.g., malicious.com">
+                            <button class="btn btn-danger" id="btn-add-network-deny">Add</button>
+                        </div>
+                        <div class="rule-list" id="network-deny-list">
+                            <p class="empty-list">Loading...</p>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- File Allowed -->
+                <div class="card">
+                    <div class="card-header">
+                        <h3>📁 Safe File Paths</h3>
+                    </div>
+                    <div class="card-body">
+                        <div class="add-rule-form">
+                            <input type="text" id="file-allow-input" placeholder="e.g., ~/projects/**">
+                            <button class="btn btn-primary" id="btn-add-file-allow">Add</button>
+                        </div>
+                        <div class="rule-list" id="file-allow-list">
+                            <p class="empty-list">Loading...</p>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- File Denied -->
+                <div class="card">
+                    <div class="card-header">
+                        <h3>🔒 Blocked File Paths</h3>
+                    </div>
+                    <div class="card-body">
+                        <div class="add-rule-form">
+                            <input type="text" id="file-deny-input" placeholder="e.g., ~/.ssh/**">
+                            <button class="btn btn-danger" id="btn-add-file-deny">Add</button>
+                        </div>
+                        <div class="rule-list" id="file-deny-list">
+                            <p class="empty-list">Loading...</p>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Testing Tab -->
+        <div class="tab-content" id="testing-tab">
+            <div class="grid">
+                <!-- Sanitizer Test -->
+                <div class="card card-wide">
+                    <div class="card-header">
+                        <h3>🔐 Secret Detection & Sanitization</h3>
+                    </div>
+                    <div class="card-body">
+                        <textarea id="sanitize-input" placeholder="Paste text with potential secrets (API keys, tokens, passwords)..." rows="6"></textarea>
+                        <div style="display: flex; gap: 0.5rem; margin-top: 0.5rem;">
+                            <button class="btn btn-primary" id="btn-detect-secrets">🔍 Detect Secrets</button>
+                            <button class="btn btn-primary" id="btn-sanitize">🧹 Sanitize</button>
+                        </div>
+                        <div class="sanitize-result hidden" id="sanitize-result" style="margin-top: 1rem;">
+                            <h4>Result:</h4>
+                            <pre id="sanitize-output"></pre>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Command Checker -->
+                <div class="card">
+                    <div class="card-header">
+                        <h3>⚡ Command Checker</h3>
+                    </div>
+                    <div class="card-body">
+                        <input type="text" id="command-input" placeholder="Enter command to check (e.g., rm -rf /)">
+                        <button class="btn btn-primary" id="btn-check-command">Check</button>
+                        <div class="check-result hidden" id="check-result" style="margin-top: 1rem;">
+                            <div class="result-badge" id="result-badge"></div>
+                            <p id="check-reason"></p>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- File Path Checker -->
+                <div class="card">
+                    <div class="card-header">
+                        <h3>📂 File Path Checker</h3>
+                    </div>
+                    <div class="card-body">
+                        <input type="text" id="file-path-input" placeholder="Enter file path (e.g., /etc/shadow)">
+                        <button class="btn btn-primary" id="btn-check-file">Check</button>
+                        <div class="check-result hidden" id="file-check-result" style="margin-top: 1rem;">
+                            <div class="result-badge" id="file-result-badge"></div>
+                            <p id="file-check-reason"></p>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- URL Checker -->
+                <div class="card">
+                    <div class="card-header">
+                        <h3>🌐 URL Checker</h3>
+                    </div>
+                    <div class="card-body">
+                        <input type="text" id="url-input" placeholder="Enter URL (e.g., http://169.254.169.254)">
+                        <button class="btn btn-primary" id="btn-check-url">Check</button>
+                        <div class="check-result hidden" id="url-check-result" style="margin-top: 1rem;">
+                            <div class="result-badge" id="url-result-badge"></div>
+                            <p id="url-check-reason"></p>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script src="/static/js/app-enhanced.js"></script>
+</body>
+</html>

@@ -1,0 +1,80 @@
+#!/bin/bash
+# ClawGuard shell wrapper - intercepts all commands before execution
+# This wrapper sits between OpenClaw and the actual shell
+
+CLAWGUARD_API="${CLAWGUARD_API:-http://localhost:19820}"
+ORIGINAL_SHELL="${CLAWGUARD_ORIGINAL_SHELL:-/bin/bash}"
+
+# Fail mode: "open" = allow if daemon down, "closed" = block if daemon down
+FAIL_MODE="${CLAWGUARD_FAIL_MODE:-open}"
+
+check_command() {
+    local cmd="$1"
+    
+    # Check if daemon is running
+    if ! curl -s -f -m 1 "$CLAWGUARD_API/status" >/dev/null 2>&1; then
+        if [ "$FAIL_MODE" = "closed" ]; then
+            echo "❌ ClawGuard: Daemon offline, blocking command for safety" >&2
+            return 1
+        fi
+        # Fail open - allow command when daemon is down
+        return 0
+    fi
+    
+    # Send command to ClawGuard for checking
+    local response
+    response=$(curl -s -X POST "$CLAWGUARD_API/check/command" \
+        -H "Content-Type: application/json" \
+        -d "{\"command\": $(printf '%s' "$cmd" | jq -Rs .)}" 2>/dev/null)
+    
+    if [ $? -ne 0 ] || [ -z "$response" ]; then
+        # API call failed
+        if [ "$FAIL_MODE" = "closed" ]; then
+            echo "❌ ClawGuard: API call failed, blocking command" >&2
+            return 1
+        fi
+        return 0
+    fi
+    
+    local result
+    result=$(echo "$response" | jq -r '.result' 2>/dev/null)
+    
+    case "$result" in
+        allow)
+            return 0
+            ;;
+        deny)
+            local reason
+            reason=$(echo "$response" | jq -r '.reason // "Policy violation"' 2>/dev/null)
+            echo "🛡️  ClawGuard: Command BLOCKED - $reason" >&2
+            return 1
+            ;;
+        supervised)
+            local reason
+            reason=$(echo "$response" | jq -r '.reason // "Requires approval"' 2>/dev/null)
+            echo "⏸️  ClawGuard: Command requires APPROVAL - $reason" >&2
+            echo "    Check dashboard at http://localhost:19821 or approve via CLI" >&2
+            return 1
+            ;;
+        *)
+            # Unknown result
+            if [ "$FAIL_MODE" = "closed" ]; then
+                echo "❌ ClawGuard: Unknown response, blocking command" >&2
+                return 1
+            fi
+            return 0
+            ;;
+    esac
+}
+
+# Handle OpenClaw's exec pattern: bash -c "command"
+if [ "$1" = "-c" ]; then
+    if check_command "$2"; then
+        exec "$ORIGINAL_SHELL" -c "$2"
+    else
+        exit 1
+    fi
+fi
+
+# For interactive shells or other invocations, pass through
+exec "$ORIGINAL_SHELL" "$@"

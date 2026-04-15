@@ -1,0 +1,73 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "clawguard"
+version = "1.0.0"
+description = "ClawGuard: Runtime Security Framework for Tool-Augmented LLM Agents Against Indirect Prompt Injection"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.10"
+authors = [
+    {name = "Friday AI Assistant"}
+]
+keywords = ["ai", "agent", "security", "sandbox", "guard"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Security",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+
+dependencies = [
+    "fastapi>=0.100.0",
+    "uvicorn>=0.23.0",
+    "pyyaml>=6.0",
+    "sqlalchemy>=2.0",
+    "httpx>=0.25.0",
+    "watchdog>=3.0",
+    "sse-starlette>=1.6.0",
+    "pydantic>=2.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-asyncio>=0.21",
+    "httpx>=0.25.0",
+    "black>=23.0",
+    "ruff>=0.1.0",
+]
+
+[project.scripts]
+clawguard = "clawguard.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/Claw-Guard/ClawGuard"
+Documentation = "https://github.com/Claw-Guard/ClawGuard#readme"
+Repository = "https://github.com/Claw-Guard/ClawGuard"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["clawguard*"]
+
+[tool.black]
+line-length = 100
+target-version = ['py310', 'py311', 'py312', 'py313', 'py314']
+
+[tool.ruff]
+line-length = 100
+select = ["E", "F", "W", "I", "N", "UP", "B", "C4"]
+ignore = ["E501"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
