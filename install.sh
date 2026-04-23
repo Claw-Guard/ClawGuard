@@ -154,7 +154,6 @@ echo "[5/6] Installing OpenClaw config transform..."
 TRANSFORM_DEST="$HOME/.openclaw/workspace/tests"
 mkdir -p "$TRANSFORM_DEST"
 cp "$INSTALL_DIR/tests/transform.js" "$TRANSFORM_DEST/transform.js"
-cp "$INSTALL_DIR/docs/CLAWGUARD_TRANSFORM.md" "$TRANSFORM_DEST/CLAWGUARD_TRANSFORM.md"
 success "transform.js installed to $TRANSFORM_DEST"
 echo ""
 
