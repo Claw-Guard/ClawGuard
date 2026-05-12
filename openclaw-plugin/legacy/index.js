@@ -244,11 +244,11 @@ export default function (api) {
     },
   });
 
-  // Tool: cg_write_file — replaces write / edit / apply_patch
+  // Tool: cg_write_file — replaces write
   api.registerTool({
     name: "cg_write_file",
     description:
-      "Write a file through the ClawGuard security engine. Sensitive paths are automatically blocked and written content is scanned by the sanitizer to prevent leaking secrets. Replaces the native write / edit / apply_patch tools.",
+      "Write a file through the ClawGuard security engine. Sensitive paths are automatically blocked and written content is scanned by the sanitizer to prevent leaking secrets. Replaces the native write tool. For targeted edits to an existing file, use cg_edit_file instead.",
     parameters: {
       type: "object",
       properties: {
@@ -265,6 +265,46 @@ export default function (api) {
         });
         if (!res.error && !res.pending) {
           return { content: [{ type: "text", text: res.result || `✅ File written: ${params.path}` }] };
+        }
+        return formatResult(res);
+      } catch (e) {
+        return formatError(e);
+      }
+    },
+  });
+
+  // Tool: cg_edit_file — replaces edit / apply_patch
+  api.registerTool({
+    name: "cg_edit_file",
+    description:
+      "Make precise targeted edits to an existing file through the ClawGuard security engine. Each edit specifies an oldText (must match exactly once in the file) and a newText replacement. Replaces the native edit / apply_patch tools.",
+    parameters: {
+      type: "object",
+      properties: {
+        path: { type: "string", description: "Absolute file path or path starting with ~" },
+        edits: {
+          type: "array",
+          description: "One or more targeted replacements. Each oldText must be unique and non-overlapping in the file.",
+          items: {
+            type: "object",
+            properties: {
+              oldText: { type: "string", description: "Exact text to replace (must match exactly once in the file)" },
+              newText: { type: "string", description: "Replacement text" },
+            },
+            required: ["oldText", "newText"],
+          },
+        },
+      },
+      required: ["path", "edits"],
+    },
+    async execute(_id, params) {
+      try {
+        const res = await callTool("edit_file", {
+          path: params.path,
+          edits: params.edits,
+        });
+        if (!res.error) {
+          return { content: [{ type: "text", text: res.result || `✅ Edits applied: ${params.path}` }] };
         }
         return formatResult(res);
       } catch (e) {
@@ -295,29 +335,122 @@ export default function (api) {
     },
   });
 
-  // Tool: cg_http_request — replaces browser / network tools
+  // Tool: cg_http_request — replaces web_fetch / browser / network tools
   api.registerTool({
     name: "cg_http_request",
     description:
-      "Make an HTTP request through the ClawGuard security engine. Only allowlisted domains are permitted; unauthorized external requests are automatically blocked to prevent data exfiltration. Replaces native network tools.",
+      "Fetch a URL through the ClawGuard security engine. Only allowlisted domains are permitted. HTML responses are automatically converted to readable markdown or plain text (similar to web_fetch). Replaces native network tools.",
     parameters: {
       type: "object",
       properties: {
-        method: { type: "string", enum: ["GET", "POST", "PUT", "DELETE"], description: "HTTP method" },
-        url: { type: "string", description: "Request URL" },
-        headers: { type: "object", description: "Request headers" },
-        body: { type: "string", description: "Request body" },
+        url: { type: "string", description: "HTTP or HTTPS URL to fetch" },
+        method: { type: "string", enum: ["GET", "POST", "PUT", "DELETE"], description: "HTTP method (default: GET)", default: "GET" },
+        extract_mode: {
+          type: "string",
+          enum: ["markdown", "text", "raw"],
+          description: "Extraction mode for HTML responses: \"markdown\" (default, HTML→markdown), \"text\" (strip all tags), \"raw\" (raw response body)",
+          default: "markdown",
+        },
+        max_chars: { type: "integer", description: "Maximum characters to return (truncates when exceeded). Minimum: 100.", minimum: 100 },
+        headers: { type: "object", description: "Additional request headers" },
+        body: { type: "string", description: "Request body (for POST/PUT)" },
       },
-      required: ["method", "url"],
+      required: ["url"],
     },
     async execute(_id, params) {
       try {
         const res = await callTool("http_request", {
-          method: params.method,
+          method: params.method || "GET",
           url: params.url,
+          extract_mode: params.extract_mode || "markdown",
+          max_chars: params.max_chars,
           headers: params.headers,
           body: params.body,
         });
+        return formatResult(res);
+      } catch (e) {
+        return formatError(e);
+      }
+    },
+  });
+
+  // ============================================
+  // Scope tools — per-prompt least-privilege
+  // ============================================
+
+  // Tool: cg_set_task_scope
+  api.registerTool({
+    name: "cg_set_task_scope",
+    description:
+      "Declare what this task needs BEFORE executing any other tools. " +
+      "Sets per-prompt least-privilege restrictions: only the declared file paths, commands, network domains, and tools will be allowed. " +
+      "Everything not declared is blocked. Call this once at the start of every new user request. " +
+      "Base security rules (rules.yaml) always apply on top \u2014 task scope can only further restrict, never override base denials.",
+    parameters: {
+      type: "object",
+      properties: {
+        task_description: {
+          type: "string",
+          description: "Brief description of what the user asked (for audit trail)",
+        },
+        file_read: {
+          type: "array",
+          items: { type: "string" },
+          description: "File/directory paths this task needs to READ. Supports globs (~/project/**). Empty array = no reads allowed.",
+        },
+        file_write: {
+          type: "array",
+          items: { type: "string" },
+          description: "File/directory paths this task needs to WRITE. Empty array = no writes allowed.",
+        },
+        commands: {
+          type: "array",
+          items: { type: "string" },
+          description: "Command prefixes this task needs to execute (e.g. ['git', 'python3', 'cat']). Empty array = no commands allowed.",
+        },
+        network: {
+          type: "array",
+          items: { type: "string" },
+          description: "Network domains this task needs to access (e.g. ['api.github.com']). Empty array = no network allowed.",
+        },
+        disable_tools: {
+          type: "array",
+          items: {
+            type: "string",
+            enum: ["execute_command", "read_file", "write_file", "edit_file", "list_directory", "http_request"],
+          },
+          description: "Tools to completely disable for this task. Use this for tools you definitely don't need.",
+        },
+      },
+      required: ["task_description"],
+    },
+    async execute(_id, params) {
+      try {
+        const res = await callTool("set_task_scope", {
+          task_description: params.task_description,
+          file_read: params.file_read || [],
+          file_write: params.file_write || [],
+          commands: params.commands || [],
+          network: params.network || [],
+          disable_tools: params.disable_tools || [],
+        });
+        return formatResult(res);
+      } catch (e) {
+        return formatError(e);
+      }
+    },
+  });
+
+  // Tool: cg_clear_task_scope
+  api.registerTool({
+    name: "cg_clear_task_scope",
+    description:
+      "Clear the current task scope, removing all per-task restrictions. Base security rules (rules.yaml) still apply. " +
+      "Use this when a task is complete or if scope is too restrictive.",
+    parameters: { type: "object", properties: {} },
+    async execute() {
+      try {
+        const res = await callTool("clear_task_scope", {});
         return formatResult(res);
       } catch (e) {
         return formatError(e);
@@ -413,7 +546,7 @@ export default function (api) {
     parameters: { type: "object", properties: {} },
     async execute() {
       try {
-        await agPost("/api/panic", {});
+        await agPost("/panic", {});
         return {
           content: [{ type: "text", text: "🔴 ClawGuard emergency paused. All subsequent operations will be blocked.\n   To resume: call cg_resume or use the Dashboard." }],
         };
@@ -434,7 +567,7 @@ export default function (api) {
     parameters: { type: "object", properties: {} },
     async execute() {
       try {
-        await agPost("/api/resume", {});
+        await agPost("/resume", {});
         const status = await agGet("/api/status");
         const modeLabel = { enforce: "Enforce (block)", supervised: "Supervised (approval)", permissive: "Permissive (log only)" };
         return {

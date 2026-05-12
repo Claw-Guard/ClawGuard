@@ -224,7 +224,7 @@ function _renderApprovalList(requests) {
                 <span class="approval-time">${new Date(req.created_at * 1000).toLocaleTimeString()}</span>
                 <span class="approval-countdown" id="countdown-${req.id}">60s</span>
             </div>
-            <div class="approval-operation">${req.operation}</div>
+            <div class="approval-operation" onclick="this.classList.toggle('expanded')" title="Click to expand/collapse">${req.operation}</div>
             <div class="approval-reason">${req.reason}</div>
             <div class="approval-actions">
                 <button onclick="approveRequest('${req.id}')" class="btn btn-success btn-small">✓ Approve</button>
@@ -542,6 +542,9 @@ async function loadRules() {
         const res = await fetch(`${API_BASE}/rules/list`);
         const data = await res.json();
         
+        // Task scope (top of page)
+        renderTaskScope(data.task_scope);
+        
         // Network allowed
         renderRuleList('network-allow-list', data.network.allowed_domains, 'network', 'allow');
         
@@ -569,10 +572,18 @@ function renderRuleList(elementId, rules, type, action) {
     
     container.innerHTML = rules.map(rule => `
         <div class="rule-item">
-            <span class="rule-text">${rule}</span>
-            <button class="btn-remove" onclick="removeRule('${type}', '${action}', '${escapeHtml(rule)}')">Remove</button>
+            <span class="rule-text">${escapeHtml(rule)}</span>
+            <button class="btn-remove" data-rule-type="${type}" data-rule-action="${action}" data-rule-value="${escapeHtml(rule)}">Remove</button>
         </div>
     `).join('');
+
+    container.querySelectorAll('.btn-remove').forEach(button => {
+        button.addEventListener('click', () => removeRule(
+            button.dataset.ruleType,
+            button.dataset.ruleAction,
+            button.dataset.ruleValue
+        ));
+    });
 }
 
 async function addRule(type, action) {
@@ -624,7 +635,9 @@ async function removeRule(type, action, value) {
 function escapeHtml(text) {
     const div = document.createElement('div');
     div.textContent = text;
-    return div.innerHTML.replace(/'/g, "\\'");
+    return div.innerHTML
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
 }
 
 // =====================================
@@ -723,6 +736,159 @@ function clearDownloadFilters() {
 }
 
 // =====================================
+// Task Scope Display
+// =====================================
+
+function renderTaskScope(taskScope) {
+    const badge = document.getElementById('task-scope-badge');
+    const inactive = document.getElementById('task-scope-inactive');
+    const details = document.getElementById('task-scope-details');
+    const clearBtn = document.getElementById('clear-scope-btn');
+    const lockBtn = document.getElementById('task-scope-lock-btn');
+    const locked = !!(taskScope && taskScope.locked);
+
+    if (lockBtn) {
+        lockBtn.textContent = locked ? '🔓 Enable Task Scope' : '🔒 Base Rules Only';
+        lockBtn.disabled = !!(taskScope && taskScope.active);
+        lockBtn.style.opacity = (taskScope && taskScope.active) ? '0.6' : '1';
+        lockBtn.title = (taskScope && taskScope.active)
+            ? 'Clear the active task scope before toggling base-rules-only mode'
+            : (locked ? 'Allow agents to use task scope again' : 'Prevent future task scope from being set');
+    }
+
+    if (!taskScope || !taskScope.active) {
+        badge.textContent = locked ? 'Locked (Base Rules Only)' : 'Inactive';
+        badge.style.background = locked ? '#f5a623' : '#657786';
+        inactive.style.display = '';
+        inactive.textContent = locked
+            ? 'Task scope is locked. Only base rules are active; future set_task_scope calls will be rejected.'
+            : 'No task scope active — agent has not declared per-task restrictions.';
+        details.style.display = 'none';
+        if (clearBtn) clearBtn.style.display = 'none';
+        return;
+    }
+
+    badge.textContent = 'Active';
+    badge.style.background = '#17bf63';
+    inactive.style.display = 'none';
+    details.style.display = '';
+    if (clearBtn) clearBtn.style.display = '';
+
+    const rules = taskScope.rules || {};
+
+    renderScopeList('task-scope-file-read', rules.file_read);
+    renderScopeList('task-scope-file-write', rules.file_write);
+    renderScopeList('task-scope-commands', rules.commands);
+    renderScopeList('task-scope-network', rules.network);
+
+    const disabled = rules.disabled_tools || rules.disable_tools || [];
+    const disabledSection = document.getElementById('task-scope-disabled-tools');
+    if (disabled.length > 0) {
+        disabledSection.style.display = '';
+        renderScopeList('task-scope-disabled-list', disabled);
+    } else {
+        disabledSection.style.display = 'none';
+    }
+}
+
+async function toggleTaskScopeLock() {
+    try {
+        const statusRes = await fetch(`${API_BASE}/status`);
+        const status = await statusRes.json();
+        const active = !!(status.task_scope && status.task_scope.active);
+        const locked = !!(status.task_scope && status.task_scope.locked);
+
+        if (active) {
+            alert('Cannot toggle base-rules-only mode while a task scope is active. Clear the current task scope first.');
+            return;
+        }
+
+        const endpoint = locked ? '/task-scope/unlock' : '/task-scope/lock';
+        const res = await fetch(`${API_BASE}${endpoint}`, { method: 'POST' });
+        const data = await res.json();
+        if (data.error) {
+            alert(data.error);
+            return;
+        }
+        await refreshStatus();
+        await loadRules();
+    } catch (err) {
+        alert('Failed to toggle task scope lock: ' + err.message);
+    }
+}
+
+async function clearTaskScope() {
+    try {
+        const res = await fetch(`${API_BASE}/task-scope/clear`, { method: 'POST' });
+        if (!res.ok) {
+            // Fallback for older backend: use tool-call route if direct endpoint doesn't exist
+            const alt = await fetch(`${API_BASE}/api/tool/call`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ tool: 'clear_task_scope', input: {} })
+            });
+            const altData = await alt.json();
+            if (altData.error) throw new Error(altData.error);
+        }
+        await refreshStatus();
+        await loadRules();
+    } catch (err) {
+        alert('Failed to clear task scope: ' + err.message);
+    }
+}
+
+function renderScopeList(elementId, items) {
+    const el = document.getElementById(elementId);
+    if (!items || items.length === 0) {
+        el.innerHTML = '<p class="empty-list" style="padding: 0.25rem; font-size: 0.85rem;">None</p>';
+        return;
+    }
+    el.innerHTML = items.map(item => `
+        <div class="rule-item" style="padding: 0.25rem 0.5rem;">
+            <span class="rule-text" style="font-size: 0.85rem;">${escapeHtml(String(item))}</span>
+        </div>
+    `).join('');
+}
+
+// =====================================
+// Rules Download
+// =====================================
+
+async function downloadRules() {
+    try {
+        const res = await fetch(`${API_BASE}/rules/list`);
+        const data = await res.json();
+
+        const payload = {
+            exported_at: new Date().toISOString(),
+            task_scope: data.task_scope || { active: false, rules: {} },
+            base_rules: {
+                network: data.network,
+                file: data.file,
+            },
+        };
+
+        const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `clawguard_rules_${new Date().toISOString().slice(0,10)}.json`;
+        document.body.appendChild(a);
+        a.click();
+        URL.revokeObjectURL(url);
+        document.body.removeChild(a);
+
+        const btn = document.getElementById('btn-download-rules');
+        const orig = btn.textContent;
+        btn.textContent = '\u2705 Downloaded!';
+        btn.style.background = '#17bf63';
+        setTimeout(() => { btn.textContent = orig; btn.style.background = '#1da1f2'; }, 2000);
+    } catch (err) {
+        alert('Failed to download rules: ' + err.message);
+    }
+}
+
+// =====================================
 // Start
 // =====================================
 
@@ -733,4 +899,5 @@ document.addEventListener('DOMContentLoaded', () => {
     document.getElementById('btn-download-log').addEventListener('click', () => downloadAuditLog(false));
     document.getElementById('btn-download-filtered').addEventListener('click', () => downloadAuditLog(true));
     document.getElementById('btn-clear-filters').addEventListener('click', clearDownloadFilters);
+    document.getElementById('btn-download-rules').addEventListener('click', downloadRules);
 });

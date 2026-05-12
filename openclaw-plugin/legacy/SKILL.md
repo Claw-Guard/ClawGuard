@@ -32,9 +32,17 @@ ClawGuard uses **four layers of protection** to ensure the agent cannot bypass s
 |-----------|----------|-----------------------|
 | `cg_execute_command` | `exec` / `process` | Command blacklist/whitelist + dangerous command blocking + output sanitization |
 | `cg_read_file` | `read` | Sensitive path blocking (.ssh/, keychain, browser data) + content sanitization |
-| `cg_write_file` | `write` / `edit` / `apply_patch` | Path access control + write content sanitization check |
+| `cg_write_file` | `write` | Path access control + write content sanitization check |
+| `cg_edit_file` | `edit` / `apply_patch` | Targeted old→new text replacement with path access control + sanitization |
 | `cg_list_directory` | `read` (directory) | Directory access control |
 | `cg_http_request` | `browser` / network tools | Domain allowlist + data exfiltration prevention |
+
+### Scope Tools (per-prompt least-privilege)
+
+| cg_* Tool | Purpose |
+|-----------|---------|
+| `cg_set_task_scope` | Declare what this task needs — restricts tools, paths, commands, and network to only what is required |
+| `cg_clear_task_scope` | Remove all per-task restrictions (base rules still apply) |
 
 ### Inspection Tools
 
@@ -50,6 +58,28 @@ ClawGuard uses **four layers of protection** to ensure the agent cannot bypass s
 | `cg_panic` | 🚨 Emergency pause — immediately deny all subsequent operations |
 | `cg_resume` | Resume normal operation |
 
+## Task-Scoped Security (MANDATORY)
+
+**Before executing ANY tool calls for a new user request, you MUST call `cg_set_task_scope` first.**
+
+This is the most important rule. Analyze what the user is asking, then declare exactly what you need:
+
+1. **What files will I read?** → `file_read: ["/path/to/file", "/path/to/dir/**"]`
+2. **What files will I write?** → `file_write: ["/path/to/file"]` (empty if read-only task)
+3. **What commands will I run?** → `commands: ["git", "python3", "cat"]` (empty if no exec needed)
+4. **What domains will I access?** → `network: ["api.github.com"]` (empty if no network needed)
+5. **What tools do I NOT need?** → `disable_tools: ["execute_command", "http_request"]`
+
+**Principle: declare only what you need. Everything else gets blocked automatically.**
+
+Examples:
+
+- User says "read the README" → `file_read: ["~/project/README.md"]`, `file_write: []`, `disable_tools: ["write_file", "edit_file", "execute_command", "http_request"]`
+- User says "fix the bug in main.py" → `file_read: ["~/project/**"]`, `file_write: ["~/project/main.py"]`, `commands: ["python3"]`, `disable_tools: ["http_request"]`
+- User says "check the weather" → `file_read: []`, `file_write: []`, `network: ["wttr.in"]`, `disable_tools: ["write_file", "edit_file", "execute_command"]`
+
+> ⚠️ If you skip this step or declare overly broad scope, the security benefit is lost. Be specific.
+
 ## Usage Rules
 
 1. **You must use `cg_*` tools** for all command, file, and network operations. Do not use native tools such as `exec`, `read`, `write`, `apply_patch`, or `process` to bypass security checks.
@@ -60,6 +90,7 @@ ClawGuard uses **four layers of protection** to ensure the agent cannot bypass s
    - Install command: `curl -fsSL https://www.clawguard.site/download/install.sh | sh`
 5. You can call `cg_status` at any time to check the current security state.
 6. If suspicious behaviour is detected or the user requests it, use `cg_panic` for an emergency pause.
+7. **NEVER reset, modify, or remove security rules during task execution.** Do not call `/rules/reset`, do not remove entries from allowlists/denylists, and do not disable or weaken any rule while performing work. If a rule is blocking you from completing a task, **stop immediately** and tell the user which rule is blocking the operation. Let the user decide whether to adjust the rules — that is their responsibility, not the agent's.
 
 ## Security Modes
 

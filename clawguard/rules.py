@@ -80,6 +80,17 @@ class RuleEngine:
         # Initialize script analyzer
         self.script_analyzer = ScriptAnalyzer(rule_engine=self) if ScriptAnalyzer else None
         
+        # Task scope state (per-session injected rules)
+        self.task_scope_active = False
+        self.task_scope_locked = False  # When True, set_task_scope calls are rejected
+        self.task_scope_rules = {
+            "file_read": [],
+            "file_write": [],
+            "commands": [],
+            "network": [],
+            "disabled_tools": [],
+        }
+        
         if rules_config:
             self._load_rules(rules_config)
     
@@ -183,7 +194,7 @@ class RuleEngine:
             commands_to_check.append(normalized_cmd)
         
         for cmd_to_check in commands_to_check:
-            # 1. Check blacklist first (highest priority)
+            # 1. Check blacklist first (highest priority — task scope cannot override)
             for rule in self.command_rules["blacklist"]:
                 if rule["pattern"].search(cmd_to_check):
                     return RuleMatch(
@@ -193,8 +204,14 @@ class RuleEngine:
                         pattern=rule["raw_pattern"],
                         rule_type="command_blacklist",
                     )
-            
-            # 2. Check whitelist (allow)
+        
+        # 2. Task scope check — after blacklist, restricts to declared commands
+        task_scope_result = self._check_task_scope_command(command)
+        if task_scope_result is not None:
+            return task_scope_result
+        
+        for cmd_to_check in commands_to_check:
+            # 3. Check whitelist (allow)
             for rule in self.command_rules["whitelist"]:
                 if rule["pattern"].search(cmd_to_check):
                     return RuleMatch(
@@ -205,7 +222,7 @@ class RuleEngine:
                         rule_type="command_whitelist",
                     )
             
-            # 3. Check supervised list
+            # 4. Check supervised list
             for rule in self.command_rules["supervised"]:
                 if rule["pattern"].search(cmd_to_check):
                     return RuleMatch(
@@ -216,7 +233,7 @@ class RuleEngine:
                         rule_type="command_supervised",
                     )
         
-        # 4. DefaultAllow
+        # 5. DefaultAllow
         return RuleMatch(
             matched=False,
             action=ActionType.ALLOW,
@@ -452,7 +469,7 @@ class RuleEngine:
 
         abs_path = real_path
 
-        # 1. Check denied paths
+        # 1. Check denied paths (ALWAYS first — task scope cannot override)
         for denied in self.file_rules["denied_paths"]:
             denied_expanded = os.path.expanduser(denied)
             if abs_path.startswith(denied_expanded) or fnmatch.fnmatch(abs_path, denied_expanded):
@@ -463,7 +480,12 @@ class RuleEngine:
                     rule_type="file_denied",
                 )
         
-        # 2. Check sensitive file patterns
+        # 2. Task scope check — after base denials, restricts to declared paths
+        task_scope_result = self._check_task_scope_file(path, operation)
+        if task_scope_result is not None:
+            return task_scope_result
+        
+        # 3. Check sensitive file patterns
         for pattern in self.file_rules["sensitive_patterns"]:
             pattern_expanded = os.path.expanduser(pattern)
             if fnmatch.fnmatch(abs_path, pattern_expanded):
@@ -474,7 +496,7 @@ class RuleEngine:
                     rule_type="file_sensitive",
                 )
         
-        # 3. Check allowed paths
+        # 4. Check allowed paths
         for allowed in self.file_rules["allowed_paths"]:
             allowed_expanded = os.path.expanduser(allowed)
             # Support wildcards
@@ -494,7 +516,7 @@ class RuleEngine:
                     rule_type="file_allowed",
                 )
         
-        # 4. Default: supervised
+        # 5. Default: supervised
         return RuleMatch(
             matched=False,
             action=ActionType.APPROVE,
@@ -520,7 +542,7 @@ class RuleEngine:
         domain = parsed.netloc.lower()
         scheme = parsed.scheme.lower()
         
-        # 0. Block non-HTTP protocols (SSRF prevention)
+        # 0. Block non-HTTP protocols (SSRF prevention) — ALWAYS checked first
         if scheme not in ['http', 'https', '']:
             return RuleMatch(
                 matched=True,
@@ -566,7 +588,14 @@ class RuleEngine:
                     rule_type="network_denied",
                 )
         
-        # 2. Check allowed domains
+        # 2. Task scope check — after security/deny checks, before allow/approve
+        # If task scope is active and declares this domain, auto-allow it
+        # (bypasses the default approval-required flow for unknown domains)
+        task_scope_result = self._check_task_scope_network(url)
+        if task_scope_result is not None:
+            return task_scope_result
+        
+        # 3. Check allowed domains
         for allowed in self.network_rules["allowed_domains"]:
             if self._match_domain(domain, allowed):
                 return RuleMatch(
@@ -576,7 +605,7 @@ class RuleEngine:
                     rule_type="network_allowed",
                 )
         
-        # 3. Default action
+        # 4. Default action
         return RuleMatch(
             matched=False,
             action=self.network_rules["default_action"],
@@ -622,6 +651,309 @@ class RuleEngine:
             suffix = pattern[2:]
             return domain == suffix or domain.endswith("." + suffix)
         return domain == pattern
+    
+    # ================================
+    # ================================
+    # Task Scope (Per-Prompt Least-Privilege)
+    # ================================
+    
+    def is_tool_disabled(self, tool: str) -> bool:
+        """
+        Check if a tool is disabled by the active task scope.
+        Maps both internal tool names and frontend cg_* names.
+        """
+        if not self.task_scope_active:
+            return False
+        
+        disabled = self.task_scope_rules.get("disabled_tools", [])
+        if not disabled:
+            return False
+        
+        # Normalize: strip cg_ prefix for comparison
+        normalized_tool = tool.removeprefix("cg_") if tool.startswith("cg_") else tool
+        
+        for d in disabled:
+            normalized_d = d.removeprefix("cg_") if d.startswith("cg_") else d
+            if normalized_tool == normalized_d:
+                return True
+        
+        return False
+    
+    def set_task_scope(
+        self,
+        task_description: str,
+        file_read: List[str] = None,
+        file_write: List[str] = None,
+        commands: List[str] = None,
+        network: List[str] = None,
+        disabled_tools: List[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Set task scope - inject temporary per-task rules on top of base rules.
+        Task scope can only further restrict, never override base denials.
+        
+        Args:
+            task_description: Brief description of the task
+            file_read: Allowed file paths for reading (supports globs)
+            file_write: Allowed file paths for writing
+            commands: Allowed command prefixes
+            network: Allowed network domains
+            disabled_tools: Tools to completely disable
+            
+        Returns:
+            Dict with applied scope details
+        """
+        # Reject if locked to base rules only
+        if self.task_scope_locked:
+            return {
+                "error": "Task scope is locked — base rules only mode is active. Unlock from the dashboard to allow task scope.",
+                "locked": True,
+            }
+        
+        # Auto-infer disabled tools from empty scope declarations
+        # If the agent didn't declare needing a resource category,
+        # auto-disable the corresponding tool for defense-in-depth.
+        inferred_disabled = set(disabled_tools or [])
+        
+        _commands = commands or []
+        _network = network or []
+        _file_write = file_write or []
+        _file_read = file_read or []
+        
+        if not _commands:
+            inferred_disabled.add("execute_command")
+        if not _network:
+            inferred_disabled.add("http_request")
+        if not _file_write:
+            inferred_disabled.add("write_file")
+            inferred_disabled.add("edit_file")
+        
+        self.task_scope_active = True
+        self.task_scope_rules = {
+            "file_read": self._expand_paths(_file_read),
+            "file_write": self._expand_paths(_file_write),
+            "commands": _commands,
+            "network": _network,
+            "disabled_tools": list(inferred_disabled),
+        }
+        
+        return {
+            "task_description": task_description,
+            "scope_active": True,
+            "locked": self.task_scope_locked,
+            "rules": self.task_scope_rules,
+        }
+    
+    def lock_task_scope(self) -> Dict[str, Any]:
+        """
+        Lock task scope so only base rules apply.
+        Refuses to lock while a task scope is currently active.
+        """
+        if self.task_scope_active:
+            return {
+                "error": "Cannot lock task scope while a task scope is active. Clear the current scope first.",
+                "locked": self.task_scope_locked,
+                "scope_active": self.task_scope_active,
+            }
+        
+        self.task_scope_locked = True
+        return {
+            "locked": True,
+            "scope_active": False,
+            "message": "Task scope locked — base rules only mode is active",
+        }
+    
+    def unlock_task_scope(self) -> Dict[str, Any]:
+        """
+        Unlock task scope so agents may set per-task restrictions again.
+        """
+        self.task_scope_locked = False
+        return {
+            "locked": False,
+            "scope_active": self.task_scope_active,
+            "message": "Task scope unlocked",
+        }
+    
+    def clear_task_scope(self) -> Dict[str, Any]:
+        """
+        Clear task scope - remove all per-task restrictions.
+        Base rules still apply.
+        
+        Returns:
+            Dict with cleared scope status
+        """
+        self.task_scope_active = False
+        self.task_scope_rules = {
+            "file_read": [],
+            "file_write": [],
+            "commands": [],
+            "network": [],
+            "disabled_tools": [],
+        }
+        
+        return {
+            "scope_active": False,
+            "locked": self.task_scope_locked,
+            "message": "Task scope cleared",
+        }
+    
+    def _check_task_scope_file(self, path: str, operation: str) -> Optional[RuleMatch]:
+        """
+        Check if file access is allowed by task scope.
+        Returns None if task scope is not active (fall through to base rules).
+        Returns ALLOW RuleMatch if scope explicitly permits the path.
+        Returns DENY RuleMatch if task scope blocks the path.
+        """
+        if not self.task_scope_active:
+            return None
+        
+        expanded_path = os.path.expanduser(path)
+        scope_paths = self.task_scope_rules.get(f"file_{operation}", [])
+        
+        # If scope list is empty, nothing is allowed
+        if not scope_paths:
+            return RuleMatch(
+                matched=True,
+                action=ActionType.DENY,
+                reason=f"Task scope: no {operation} paths declared",
+                rule_type="task_scope",
+            )
+        
+        # Check if path matches any allowed scope path (supports globs)
+        for allowed in scope_paths:
+            expanded_allowed = os.path.expanduser(allowed)
+            
+            # Exact match
+            if expanded_path == expanded_allowed:
+                return RuleMatch(
+                    matched=True,
+                    action=ActionType.ALLOW,
+                    reason=f"Task scope: {operation} allowed for this path",
+                    rule_type="task_scope",
+                )
+            
+            # Glob match (e.g., ~/project/**)
+            if "*" in expanded_allowed:
+                if fnmatch.fnmatch(expanded_path, expanded_allowed):
+                    return RuleMatch(
+                        matched=True,
+                        action=ActionType.ALLOW,
+                        reason=f"Task scope: {operation} allowed by glob pattern",
+                        rule_type="task_scope",
+                    )
+                # ~/project/** should also allow the directory itself (~/project)
+                base = expanded_allowed.rstrip("/*")
+                if expanded_path == base or expanded_path.startswith(base + os.sep):
+                    return RuleMatch(
+                        matched=True,
+                        action=ActionType.ALLOW,
+                        reason=f"Task scope: {operation} allowed by glob pattern",
+                        rule_type="task_scope",
+                    )
+            
+            # Directory prefix match (e.g., ~/project allows ~/project/file.txt)
+            if expanded_path.startswith(expanded_allowed + os.sep):
+                return RuleMatch(
+                    matched=True,
+                    action=ActionType.ALLOW,
+                    reason=f"Task scope: {operation} allowed by directory scope",
+                    rule_type="task_scope",
+                )
+        
+        # Not in scope — deny immediately
+        return RuleMatch(
+            matched=True,
+            action=ActionType.DENY,
+            reason=f"Task scope: {operation} not allowed for this path",
+            rule_type="task_scope",
+        )
+    
+    def _check_task_scope_command(self, command: str) -> Optional[RuleMatch]:
+        """
+        Check if command is allowed by task scope.
+        Returns None if task scope is not active or command is allowed.
+        Returns DENY RuleMatch if task scope blocks the command.
+        """
+        if not self.task_scope_active:
+            return None
+        
+        scope_commands = self.task_scope_rules.get("commands", [])
+        
+        # If scope list is empty, no commands allowed
+        if not scope_commands:
+            return RuleMatch(
+                matched=True,
+                action=ActionType.DENY,
+                reason="Task scope: no commands declared",
+                rule_type="task_scope",
+            )
+        
+        # Check if command starts with any allowed prefix
+        for allowed_prefix in scope_commands:
+            if command.strip().startswith(allowed_prefix):
+                return RuleMatch(
+                    matched=True,
+                    action=ActionType.ALLOW,
+                    reason=f"Task scope: command allowed by prefix '{allowed_prefix}'",
+                    rule_type="task_scope",
+                )
+        
+        # Not in scope
+        return RuleMatch(
+            matched=True,
+            action=ActionType.DENY,
+            reason="Task scope: command not in allowed list",
+            rule_type="task_scope",
+        )
+    
+    def _check_task_scope_network(self, url: str) -> Optional[RuleMatch]:
+        """
+        Check if network access is allowed by task scope.
+        Returns None if task scope is not active (fall through to base rules).
+        Returns ALLOW RuleMatch if scope explicitly permits the domain.
+        Returns DENY RuleMatch if task scope blocks the domain.
+        
+        Unlike file/command scope checks, network scope returns ALLOW
+        (not None) so that declared domains bypass the base rules'
+        default approval-required flow.
+        """
+        if not self.task_scope_active:
+            return None
+        
+        scope_domains = self.task_scope_rules.get("network", [])
+        
+        # If scope list is empty, no network allowed
+        if not scope_domains:
+            return RuleMatch(
+                matched=True,
+                action=ActionType.DENY,
+                reason="Task scope: no network domains declared",
+                rule_type="task_scope",
+            )
+        
+        # Extract domain from URL
+        from urllib.parse import urlparse
+        parsed = urlparse(url)
+        domain = parsed.netloc.lower()
+        
+        # Check if domain matches any allowed scope domain
+        for allowed in scope_domains:
+            if self._match_domain(domain, allowed):
+                # Scope-declared domain — auto-allow (skip base approval)
+                return RuleMatch(
+                    matched=True,
+                    action=ActionType.ALLOW,
+                    reason=f"Task scope: domain '{domain}' declared in scope",
+                    rule_type="task_scope",
+                )
+        
+        # Not in scope
+        return RuleMatch(
+            matched=True,
+            action=ActionType.DENY,
+            reason="Task scope: network domain not in allowed list",
+            rule_type="task_scope",
+        )
     
     @classmethod
     def from_config(cls, config_path: str) -> "RuleEngine":

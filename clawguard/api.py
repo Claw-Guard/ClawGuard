@@ -19,7 +19,7 @@ from sse_starlette.sse import EventSourceResponse
 from .sanitizer import Sanitizer
 from .rules import RuleEngine, ActionType
 from .audit import AuditLogger, AuditAction, AuditResult
-from .approval import ApprovalQueue, ApprovalType, ApprovalStatus
+from .approval import ApprovalQueue, ApprovalType, ApprovalStatus, ApprovalRequest
 from .panic import PanicManager, PanicTrigger
 
 
@@ -140,7 +140,30 @@ def create_app(
     app.state.approval = ApprovalQueue(
         timeout_seconds=config.get("policy", {}).get("approval_timeout", 60),
     )
+    app.state.timeout_action = config.get("policy", {}).get("timeout_action", "deny")
     app.state.panic = PanicManager()
+    
+    # Set up approval resolution callback to log to audit
+    async def on_approval_resolution(request: ApprovalRequest):
+        """Log approval decisions to audit trail"""
+        if request.status == ApprovalStatus.APPROVED.value:
+            app.state.audit.log(
+                action=AuditAction.APPROVAL_APPROVE,
+                result=AuditResult.APPROVED,
+                operation=request.operation,
+                reason=request.resolution_reason or "Approved by user",
+                details={"approval_type": request.approval_type, "resolved_by": request.resolved_by},
+            )
+        elif request.status == ApprovalStatus.DENIED.value:
+            app.state.audit.log(
+                action=AuditAction.APPROVAL_DENY,
+                result=AuditResult.DENIED,
+                operation=request.operation,
+                reason=request.resolution_reason or "Denied by user",
+                details={"approval_type": request.approval_type, "resolved_by": request.resolved_by},
+            )
+    
+    app.state.approval.set_on_resolution(on_approval_resolution)
     
     # Dashboard directory
     dashboard_dir = Path(__file__).parent / "dashboard"
@@ -208,6 +231,11 @@ def create_app(
             "panic": app.state.panic.get_status(),
             "approval": app.state.approval.get_stats(),
             "audit": app.state.audit.get_stats(hours=24),
+            "task_scope": {
+                "active": app.state.rules.task_scope_active,
+                "locked": getattr(app.state.rules, "task_scope_locked", False),
+                "rules": app.state.rules.task_scope_rules,
+            },
         }
     
     @app.get("/api/status")
@@ -237,6 +265,18 @@ def create_app(
         tool = request.tool
         params = request.input
         
+        # Check if tool is disabled by active task scope
+        if app.state.rules.is_tool_disabled(tool):
+            app.state.audit.log(
+                action=AuditAction.RULE_DENY,
+                result=AuditResult.DENIED,
+                operation=f"tool:{tool}",
+                reason=f"Tool '{tool}' disabled by active task scope",
+                session_id=request.session_id,
+                agent_id=request.agent_id,
+            )
+            return {"error": f"Tool '{tool}' is disabled by the current task scope"}
+        
         try:
             if tool == "execute_command":
                 command = params.get("command", "")
@@ -253,8 +293,11 @@ def create_app(
                     )
                     final = await app.state.approval.wait_for_decision(approval_req.id)
                     if final.status != ApprovalStatus.APPROVED.value:
-                        return {"error": f"Command not permitted: {final.status} — {final.resolution_reason or result.reason}"}
-                    # Approved — fall through to execute
+                        if final.status == ApprovalStatus.TIMEOUT.value and app.state.timeout_action == "allow":
+                            pass  # timeout → allow
+                        else:
+                            return {"error": f"Command not permitted: {final.status} — {final.resolution_reason or result.reason}"}
+                    # Approved or timeout-allow — fall through to execute
 
                 # ALLOW or just-approved: execute the command
                 sanitized_command = app.state.sanitizer.sanitize_input(command)
@@ -277,10 +320,23 @@ def create_app(
                 offset = params.get("offset", 0)
                 limit = params.get("limit", None)
 
+                import datetime, json as _json
+                _log_path = os.path.expanduser("~/.clawguard/read_debug.log")
+                def _rlog(stage, **kw):
+                    entry = {"ts": datetime.datetime.now().isoformat(), "stage": stage, "path": path, **kw}
+                    with open(_log_path, "a") as _lf:
+                        _lf.write(_json.dumps(entry) + "\n")
+
+                _rlog("received", offset=offset, limit=limit,
+                      task_scope_active=app.state.rules.task_scope_active,
+                      task_scope_rules=app.state.rules.task_scope_rules)
+
                 result = app.state.rules.check_file_path(path, "read")
+                _rlog("rule_check", action=str(result.action), reason=result.reason)
 
                 if result.action == ActionType.DENY:
                     app.state.audit.log_file_access(path, "read", AuditResult.DENIED, result.reason, request.session_id, request.agent_id)
+                    _rlog("denied")
                     return {"error": result.reason}
                 elif result.action == ActionType.APPROVE:
                     approval_req = await app.state.approval.add_request(
@@ -290,23 +346,37 @@ def create_app(
                     )
                     final = await app.state.approval.wait_for_decision(approval_req.id)
                     if final.status != ApprovalStatus.APPROVED.value:
-                        return {"error": f"File read not permitted: {final.status} — {final.resolution_reason or result.reason}"}
-                    # Approved — fall through to read
+                        if final.status == ApprovalStatus.TIMEOUT.value and app.state.timeout_action == "allow":
+                            pass
+                        else:
+                            _rlog("approval_denied", status=final.status)
+                            return {"error": f"File read not permitted: {final.status} — {final.resolution_reason or result.reason}"}
 
                 # ALLOW or just-approved: read the file
-                with open(os.path.expanduser(path), 'r') as f:
-                    if offset > 0:
-                        for _ in range(offset):
+                expanded = os.path.expanduser(path)
+                file_exists = os.path.exists(expanded)
+                file_size = os.path.getsize(expanded) if file_exists else -1
+                _rlog("pre_read", expanded=expanded, exists=file_exists, size_bytes=file_size)
+
+                with open(expanded, 'r') as f:
+                    if offset > 1:
+                        for _ in range(offset - 1):
                             f.readline()
                     if limit:
                         content = ''.join([f.readline() for _ in range(limit)])
                     else:
                         content = f.read()
+
+                _rlog("post_read", content_len=len(content), content_preview=repr(content[:80]))
+
                 sanitized_content = app.state.sanitizer.sanitize_output(content)
+                _rlog("post_sanitize", sanitized_len=len(sanitized_content), sanitized_preview=repr(sanitized_content[:80]))
+
                 app.state.audit.log_file_access(
                     path, "read", AuditResult.ALLOWED, result.reason,
                     request.session_id, request.agent_id
                 )
+                _rlog("returning", result_len=len(sanitized_content))
                 return {"result": sanitized_content}
             
             elif tool == "write_file":
@@ -326,8 +396,11 @@ def create_app(
                     )
                     final = await app.state.approval.wait_for_decision(approval_req.id)
                     if final.status != ApprovalStatus.APPROVED.value:
-                        return {"error": f"File write not permitted: {final.status} — {final.resolution_reason or result.reason}"}
-                    # Approved — fall through to write
+                        if final.status == ApprovalStatus.TIMEOUT.value and app.state.timeout_action == "allow":
+                            pass  # timeout → allow
+                        else:
+                            return {"error": f"File write not permitted: {final.status} — {final.resolution_reason or result.reason}"}
+                    # Approved or timeout-allow — fall through to write
 
                 # ALLOW or just-approved: write the file
                 expanded_path = os.path.expanduser(path)
@@ -352,8 +425,11 @@ def create_app(
                     )
                     final = await app.state.approval.wait_for_decision(approval_req.id)
                     if final.status != ApprovalStatus.APPROVED.value:
-                        return {"error": f"Directory listing not permitted: {final.status} — {final.resolution_reason or result.reason}"}
-                    # Approved — fall through to list
+                        if final.status == ApprovalStatus.TIMEOUT.value and app.state.timeout_action == "allow":
+                            pass  # timeout → allow
+                        else:
+                            return {"error": f"Directory listing not permitted: {final.status} — {final.resolution_reason or result.reason}"}
+                    # Approved or timeout-allow — fall through to list
 
                 # ALLOW or just-approved: list the directory
                 expanded_path = os.path.expanduser(path)
@@ -364,6 +440,10 @@ def create_app(
             elif tool == "http_request":
                 url = params.get("url", "")
                 method = params.get("method", "GET")
+                extract_mode = params.get("extract_mode", "markdown")
+                max_chars = params.get("max_chars", None)
+                headers = params.get("headers", {})
+                body = params.get("body", None)
 
                 result = app.state.rules.check_network(url)
 
@@ -378,14 +458,50 @@ def create_app(
                     )
                     final = await app.state.approval.wait_for_decision(approval_req.id)
                     if final.status != ApprovalStatus.APPROVED.value:
-                        return {"error": f"Network request not permitted: {final.status} — {final.resolution_reason or result.reason}"}
-                    # Approved — fall through to request
+                        if final.status == ApprovalStatus.TIMEOUT.value and app.state.timeout_action == "allow":
+                            pass  # timeout → allow
+                        else:
+                            return {"error": f"Network request not permitted: {final.status} — {final.resolution_reason or result.reason}"}
+                    # Approved or timeout-allow — fall through to request
 
                 # ALLOW or just-approved: make the HTTP request
                 import httpx
-                async with httpx.AsyncClient() as client:
-                    response = await client.request(method, url)
-                    sanitized_body = app.state.sanitizer.sanitize_output(response.text)
+                async with httpx.AsyncClient(follow_redirects=True) as client:
+                    response = await client.request(method, url, headers=headers, content=body)
+                    
+                    # Extract content based on mode
+                    content_type = response.headers.get("content-type", "").lower()
+                    raw_body = response.text
+                    
+                    # HTML→Markdown conversion
+                    if extract_mode == "markdown" and "html" in content_type:
+                        try:
+                            from html2text import HTML2Text
+                            h = HTML2Text()
+                            h.ignore_links = False
+                            h.ignore_images = False
+                            h.ignore_emphasis = False
+                            h.body_width = 0  # No wrapping
+                            extracted = h.handle(raw_body)
+                        except ImportError:
+                            # Fallback: strip HTML tags if html2text not available
+                            import re
+                            extracted = re.sub(r'<[^>]+>', '', raw_body)
+                    elif extract_mode == "text":
+                        # Strip all HTML tags
+                        import re
+                        extracted = re.sub(r'<[^>]+>', '', raw_body)
+                    else:
+                        # raw mode
+                        extracted = raw_body
+                    
+                    # Truncate if max_chars specified
+                    if max_chars and len(extracted) > max_chars:
+                        extracted = extracted[:max_chars] + "\n\n[... truncated ...]"
+                    
+                    # Sanitize output
+                    sanitized_body = app.state.sanitizer.sanitize_output(extracted)
+                    
                     app.state.audit.log_network(
                         url, AuditResult.ALLOWED, result.reason,
                         request.session_id, request.agent_id
@@ -398,6 +514,129 @@ def create_app(
                 checker = SkillChecker()
                 result = checker.check_skill(identifier)
                 return {"result": result.to_dict().get("message", "Check complete")}
+            
+            elif tool == "set_task_scope":
+                task_description = params.get("task_description", "")
+                file_read = params.get("file_read", [])
+                file_write = params.get("file_write", [])
+                commands = params.get("commands", [])
+                network = params.get("network", [])
+                disabled_tools = params.get("disable_tools", params.get("disabled_tools", []))
+                
+                scope_result = app.state.rules.set_task_scope(
+                    task_description=task_description,
+                    file_read=file_read,
+                    file_write=file_write,
+                    commands=commands,
+                    network=network,
+                    disabled_tools=disabled_tools,
+                )
+                
+                if scope_result.get("error"):
+                    app.state.audit.log(
+                        action=AuditAction.RULE_DENY,
+                        result=AuditResult.DENIED,
+                        operation=f"set_task_scope: {task_description}",
+                        reason=scope_result["error"],
+                        details={
+                            "file_read": file_read,
+                            "file_write": file_write,
+                            "commands": commands,
+                            "network": network,
+                            "disabled_tools": disabled_tools,
+                        },
+                        session_id=request.session_id,
+                        agent_id=request.agent_id,
+                    )
+                    return {"error": scope_result["error"]}
+                
+                # Log to audit
+                app.state.audit.log(
+                    action=AuditAction.RULE_DENY,  # Using RULE_DENY as category for scope operations
+                    result=AuditResult.ALLOWED,
+                    operation=f"set_task_scope: {task_description}",
+                    reason="Task scope applied — rules injected into rule engine",
+                    details={
+                        "file_read": file_read,
+                        "file_write": file_write,
+                        "commands": commands,
+                        "network": network,
+                        "disabled_tools": disabled_tools,
+                    },
+                    session_id=request.session_id,
+                    agent_id=request.agent_id,
+                )
+                
+                return {"result": f"✅ Task scope set: {task_description}"}
+            
+            elif tool == "clear_task_scope":
+                scope_result = app.state.rules.clear_task_scope()
+                
+                # Log to audit
+                app.state.audit.log(
+                    action=AuditAction.RULE_DENY,
+                    result=AuditResult.ALLOWED,
+                    operation="clear_task_scope",
+                    reason="Task scope cleared — injected rules removed from rule engine",
+                    session_id=request.session_id,
+                    agent_id=request.agent_id,
+                )
+                
+                return {"result": "✅ Task scope cleared"}
+            
+            elif tool == "edit_file":
+                path = params.get("path", "")
+                edits = params.get("edits", [])
+                
+                # Check file access permission
+                result = app.state.rules.check_file_path(path, "write")
+                
+                if result.action == ActionType.DENY:
+                    app.state.audit.log_file_access(path, "write", AuditResult.DENIED, result.reason, request.session_id, request.agent_id)
+                    return {"error": result.reason}
+                elif result.action == ActionType.APPROVE:
+                    approval_req = await app.state.approval.add_request(
+                        approval_type=ApprovalType.FILE_WRITE,
+                        operation=path,
+                        reason=result.reason,
+                    )
+                    final = await app.state.approval.wait_for_decision(approval_req.id)
+                    if final.status != ApprovalStatus.APPROVED.value:
+                        if final.status == ApprovalStatus.TIMEOUT.value and app.state.timeout_action == "allow":
+                            pass  # timeout → allow
+                        else:
+                            return {"error": f"File edit not permitted: {final.status} — {final.resolution_reason or result.reason}"}
+                
+                # Read current file content
+                expanded_path = os.path.expanduser(path)
+                try:
+                    with open(expanded_path, 'r') as f:
+                        content = f.read()
+                except FileNotFoundError:
+                    return {"error": f"File not found: {path}"}
+                
+                # Apply edits
+                modified_content = content
+                for edit in edits:
+                    old_text = edit.get("oldText", "")
+                    new_text = edit.get("newText", "")
+                    
+                    # Check that oldText appears exactly once
+                    count = modified_content.count(old_text)
+                    if count == 0:
+                        return {"error": f"oldText not found in file: {old_text[:50]}..."}
+                    elif count > 1:
+                        return {"error": f"oldText appears {count} times (must be unique): {old_text[:50]}..."}
+                    
+                    # Apply replacement
+                    modified_content = modified_content.replace(old_text, new_text, 1)
+                
+                # Write back
+                with open(expanded_path, 'w') as f:
+                    f.write(modified_content)
+                
+                app.state.audit.log_file_access(path, "write", AuditResult.ALLOWED, result.reason, request.session_id, request.agent_id)
+                return {"result": f"✅ Edits applied: {path}"}
             
             else:
                 return {"error": f"Unknown tool: {tool}"}
@@ -524,6 +763,8 @@ def create_app(
             final = await app.state.approval.wait_for_decision(approval_req.id)
             if final.status == ApprovalStatus.APPROVED.value:
                 return {"allowed": True, "action": "allow", "reason": "Approved by human"}
+            elif final.status == ApprovalStatus.TIMEOUT.value and app.state.timeout_action == "allow":
+                return {"allowed": True, "action": "allow", "reason": "Timeout → allowed by policy"}
             else:
                 return {"allowed": False, "action": "deny", "reason": f"Not approved: {final.status} — {final.resolution_reason or result.reason}"}
         
@@ -567,6 +808,8 @@ def create_app(
             final = await app.state.approval.wait_for_decision(approval_req.id)
             if final.status == ApprovalStatus.APPROVED.value:
                 return {"allowed": True, "action": "allow", "reason": "Approved by human"}
+            elif final.status == ApprovalStatus.TIMEOUT.value and app.state.timeout_action == "allow":
+                return {"allowed": True, "action": "allow", "reason": "Timeout → allowed by policy"}
             else:
                 return {"allowed": False, "action": "deny", "reason": f"Not approved: {final.status} — {final.resolution_reason or result.reason}"}
         
@@ -813,6 +1056,14 @@ def create_app(
             return {"status": "removed", "domain": domain}
         return {"status": "not_found", "domain": domain}
     
+    @app.delete("/rules/network/deny/{domain}")
+    async def remove_denied_domain(domain: str):
+        """Remove domain from network blacklist"""
+        if domain in app.state.rules.network_rules["denied_domains"]:
+            app.state.rules.network_rules["denied_domains"].remove(domain)
+            return {"status": "removed", "domain": domain}
+        return {"status": "not_found", "domain": domain}
+    
     @app.delete("/rules/file/allow")
     async def remove_allowed_path(path: str):
         """Remove path from file whitelist"""
@@ -822,9 +1073,18 @@ def create_app(
             return {"status": "removed", "path": expanded}
         return {"status": "not_found", "path": expanded}
     
+    @app.delete("/rules/file/deny")
+    async def remove_denied_path(path: str):
+        """Remove path from file blacklist"""
+        expanded = os.path.expanduser(path)
+        if expanded in app.state.rules.file_rules["denied_paths"]:
+            app.state.rules.file_rules["denied_paths"].remove(expanded)
+            return {"status": "removed", "path": expanded}
+        return {"status": "not_found", "path": expanded}
+    
     @app.get("/rules/list")
     async def list_rules():
-        """Get current runtime rules"""
+        """Get current runtime rules including task scope"""
         return {
             "network": {
                 "allowed_domains": app.state.rules.network_rules["allowed_domains"],
@@ -834,8 +1094,25 @@ def create_app(
                 "allowed_paths": app.state.rules.file_rules["allowed_paths"],
                 "denied_paths": app.state.rules.file_rules["denied_paths"],
             },
+            "task_scope": {
+                "active": app.state.rules.task_scope_active,
+                "locked": getattr(app.state.rules, "task_scope_locked", False),
+                "rules": app.state.rules.task_scope_rules,
+            },
         }
     
+    @app.post("/task-scope/lock")
+    async def lock_task_scope():
+        return app.state.rules.lock_task_scope()
+    
+    @app.post("/task-scope/unlock")
+    async def unlock_task_scope():
+        return app.state.rules.unlock_task_scope()
+    
+    @app.post("/task-scope/clear")
+    async def clear_task_scope_route():
+        return app.state.rules.clear_task_scope()
+
     return app
 
 

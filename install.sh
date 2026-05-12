@@ -18,9 +18,8 @@
 #   2. Create Python venv and install dependencies
 #   3. Copy config templates to ~/.clawguard/ (if not already present)
 #   4. Install the OpenClaw plugin to ~/.clawguard/openclaw-plugin/
-#   5. Install transform.js to ~/.openclaw/workspace/tests/
-#   6. Make bin scripts executable
-#   7. Print next steps
+#   5. Make bin scripts executable
+#   6. Print next steps
 
 set -e
 
@@ -86,6 +85,34 @@ command -v node    >/dev/null 2>&1 || error "node is required but not installed 
 PYTHON_VERSION=$(python3 -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
 info "Python version: $PYTHON_VERSION"
 
+# ── Detect OpenClaw version ───────────────────────────────────────────────────
+
+OPENCLAW_VERSION=""
+PLUGIN_VARIANT="legacy"
+
+if command -v openclaw >/dev/null 2>&1; then
+    OPENCLAW_VERSION=$(openclaw --version 2>&1 | head -1 | grep -oP '\d{4}\.\d+\.\d+' || echo "")
+
+    if [ -n "$OPENCLAW_VERSION" ]; then
+        info "Detected OpenClaw version: $OPENCLAW_VERSION"
+
+        # >= 2026.5.7 uses v5 plugin API; anything older uses legacy
+        if [ "$(printf '%s\n' "2026.5.7" "$OPENCLAW_VERSION" | sort -V | head -n1)" = "2026.5.7" ]; then
+            PLUGIN_VARIANT="v5"
+            info "Using v5 plugin variant (OpenClaw >= 2026.5.7)"
+        else
+            PLUGIN_VARIANT="legacy"
+            info "Using legacy plugin variant (OpenClaw < 2026.5.7)"
+        fi
+    else
+        warn "Could not parse OpenClaw version — defaulting to legacy variant"
+    fi
+else
+    warn "OpenClaw not found in PATH — defaulting to legacy variant"
+fi
+
+echo ""
+
 # ── Step 1: Clone or skip ─────────────────────────────────────────────────────
 
 echo "[1/6] Repository..."
@@ -139,27 +166,21 @@ echo ""
 
 # ── Step 4: Install OpenClaw plugin ──────────────────────────────────────────
 
-echo "[4/6] Installing OpenClaw plugin..."
+echo "[4/6] Installing OpenClaw plugin ($PLUGIN_VARIANT)..."
 
+PLUGIN_SOURCE="$INSTALL_DIR/openclaw-plugin/$PLUGIN_VARIANT"
 PLUGIN_DEST="$HOME/.clawguard/openclaw-plugin"
 mkdir -p "$PLUGIN_DEST"
-cp "$INSTALL_DIR/openclaw-plugin/"* "$PLUGIN_DEST/"
-success "Plugin installed to $PLUGIN_DEST"
+cp "$PLUGIN_SOURCE/index.js" "$PLUGIN_DEST/index.js"
+cp "$PLUGIN_SOURCE/SKILL.md" "$PLUGIN_DEST/SKILL.md"
+cp "$PLUGIN_SOURCE/openclaw.plugin.json" "$PLUGIN_DEST/openclaw.plugin.json"
+cp "$PLUGIN_SOURCE/package.json" "$PLUGIN_DEST/package.json"
+success "Plugin installed to $PLUGIN_DEST ($PLUGIN_VARIANT variant)"
 echo ""
 
-# ── Step 5: Install transform.js ─────────────────────────────────────────────
+# ── Step 5: Make bin scripts executable ──────────────────────────────────────
 
-echo "[5/6] Installing OpenClaw config transform..."
-
-TRANSFORM_DEST="$HOME/.openclaw/workspace/tests"
-mkdir -p "$TRANSFORM_DEST"
-cp "$INSTALL_DIR/tests/transform.js" "$TRANSFORM_DEST/transform.js"
-success "transform.js installed to $TRANSFORM_DEST"
-echo ""
-
-# ── Step 6: Make bin scripts executable ──────────────────────────────────────
-
-echo "[6/6] Making scripts executable..."
+echo "[5/5] Making scripts executable..."
 
 chmod +x "$INSTALL_DIR/bin/enable-clawguard.sh"
 chmod +x "$INSTALL_DIR/bin/disable-clawguard.sh"
@@ -179,6 +200,7 @@ echo "  ════════════════════════
 echo -e "  ${GREEN}🛡️  ClawGuard installed successfully!${NC}"
 echo "  ══════════════════════════════════════════════"
 echo ""
+echo "  Plugin variant: $PLUGIN_VARIANT (OpenClaw $OPENCLAW_VERSION)"
 echo "  Install dir:  $INSTALL_DIR"
 echo "  Config:       ~/.clawguard/config.yaml"
 echo "  Rules:        ~/.clawguard/rules.yaml"
@@ -192,6 +214,4 @@ echo -e "     ${CYAN}$INSTALL_DIR/bin/enable-clawguard.sh${NC}"
 echo ""
 echo "  2. To disable ClawGuard and restore original config:"
 echo -e "     ${CYAN}$INSTALL_DIR/bin/disable-clawguard.sh${NC}"
-echo ""
-echo "  3. Docs: $INSTALL_DIR/docs/"
 echo ""

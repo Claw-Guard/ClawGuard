@@ -1,0 +1,59 @@
+{
+  "id": "clawguard",
+  "name": "ClawGuard",
+  "description": "ClawGuard Security Engine OpenClaw Plugin — Intercept dangerous operations, audit all actions, protect sensitive data",
+  "activation": {
+    "onStartup": true
+  },
+  "skills": [
+    "."
+  ],
+  "contracts": {
+    "tools": [
+      "cg_execute_command",
+      "cg_read_file",
+      "cg_write_file",
+      "cg_edit_file",
+      "cg_list_directory",
+      "cg_http_request",
+      "cg_set_task_scope",
+      "cg_clear_task_scope",
+      "cg_skill_check",
+      "cg_status",
+      "cg_panic",
+      "cg_resume"
+    ]
+  },
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "daemonHost": {
+        "type": "string",
+        "default": "127.0.0.1",
+        "description": "ClawGuard daemon host"
+      },
+      "daemonPort": {
+        "type": "integer",
+        "default": 19821,
+        "description": "ClawGuard daemon dashboard port"
+      },
+      "healthCheckInterval": {
+        "type": "integer",
+        "default": 30,
+        "description": "Health check interval in seconds"
+      },
+      "autoReconnect": {
+        "type": "boolean",
+        "default": true,
+        "description": "Auto reconnect to daemon on failure"
+      }
+    }
+  },
+  "uiHints": {
+    "daemonHost": { "label": "Daemon Host", "placeholder": "127.0.0.1" },
+    "daemonPort": { "label": "Dashboard Port", "placeholder": "19821" },
+    "healthCheckInterval": { "label": "Health Check Interval (seconds)", "placeholder": "30" },
+    "autoReconnect": { "label": "Auto Reconnect" }
+  }
+}

@@ -4,15 +4,18 @@
 # Steps:
 #   1. Remove ~/.openclaw/skills/ folder
 #   2. Stop the nohup daemon process
-#   3. Restore openclaw_guardback.json as openclaw.json
+#   3. Use rollback.js to remove ClawGuard config from openclaw.json
 #   4. Restart OpenClaw gateway
 
 set -e
 
+CLAWGUARD_DIR="/home/amadeus/clawguard-py"  # patched by install.sh
 OPENCLAW_DIR="$HOME/.openclaw"
 OPENCLAW_JSON="$OPENCLAW_DIR/openclaw.json"
 BACKUP_JSON="$OPENCLAW_DIR/openclaw_guardback.json"
 SKILLS_DIR="$OPENCLAW_DIR/skills"
+ROLLBACK_SCRIPT="$CLAWGUARD_DIR/bin/rollback.js"
+ROLLED_BACK_JSON="$OPENCLAW_DIR/openclaw.rolled-back.json"
 PID_FILE="$HOME/.clawguard/daemon.pid"
 LOG_FILE="$HOME/.clawguard/daemon.log"
 
@@ -64,18 +67,34 @@ fi
 
 echo ""
 
-# ── Step 3: Restore backup config ────────────────────────────────────────────
+# ── Step 3: Rollback ClawGuard config ─────────────────────────────────────────
 
-echo "[3/4] Restoring openclaw.json from backup..."
+echo "[3/4] Rolling back ClawGuard config from openclaw.json..."
 
-if [ ! -f "$BACKUP_JSON" ]; then
-    echo "  ❌ Backup not found at $BACKUP_JSON — cannot restore"
-    echo "     You will need to manually restore openclaw.json"
-    exit 1
+if [ ! -f "$ROLLBACK_SCRIPT" ]; then
+    echo "  ⚠️  rollback.js not found at $ROLLBACK_SCRIPT"
+    echo "     Falling back to backup restore method..."
+    
+    if [ ! -f "$BACKUP_JSON" ]; then
+        echo "  ❌ Backup not found at $BACKUP_JSON — cannot restore"
+        echo "     You will need to manually restore openclaw.json"
+        exit 1
+    fi
+    
+    cp "$BACKUP_JSON" "$OPENCLAW_JSON"
+    echo "  ✅ Restored $BACKUP_JSON → $OPENCLAW_JSON"
+else
+    # Use rollback.js to surgically remove ClawGuard config
+    node "$ROLLBACK_SCRIPT" "$OPENCLAW_JSON" "$ROLLED_BACK_JSON"
+    cp "$ROLLED_BACK_JSON" "$OPENCLAW_JSON"
+    echo "  ✅ ClawGuard config removed from openclaw.json"
+    
+    # Keep backup for safety
+    if [ -f "$BACKUP_JSON" ]; then
+        echo "  ℹ️  Backup preserved at: $BACKUP_JSON"
+    fi
 fi
 
-cp "$BACKUP_JSON" "$OPENCLAW_JSON"
-echo "  ✅ Restored $BACKUP_JSON → $OPENCLAW_JSON"
 echo ""
 
 # ── Step 4: Restart OpenClaw gateway ─────────────────────────────────────────
@@ -92,7 +111,7 @@ echo "=================================================="
 echo "✅ ClawGuard disabled successfully!"
 echo "=================================================="
 echo ""
-echo "  OpenClaw restored to original config"
+echo "  OpenClaw config rolled back (ClawGuard entries removed)"
 echo "  Backup preserved at: $BACKUP_JSON"
 echo "  Daemon log preserved at: $LOG_FILE"
 echo ""

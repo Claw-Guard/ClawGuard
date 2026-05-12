@@ -47,7 +47,7 @@ command_rules:
       reason: "⚠️ DANGER: Overly permissive root directory"
     
     # Remote code execution
-    - pattern: "curl.*\\|\\s*(bash|sh|python|perl|ruby)|wget.*\\|\\s*(bash|sh|python|perl|ruby)"
+    - pattern: "curl.*\\|\\s*(bash|sh|python[0-9.]*|perl|ruby)\\s*$|wget.*\\|\\s*(bash|sh|python[0-9.]*|perl|ruby)\\s*$"
       action: deny
       reason: "🚨 CRITICAL: Piping remote content to interpreter"
     
@@ -142,6 +142,16 @@ command_rules:
     - pattern: "crontab\\s+-r|rm\\s+/var/spool/cron"
       action: deny
       reason: "⚠️ DANGER: Cron deletion"
+    
+    # SSH key generation/deployment (anti-injection)
+    - pattern: "ssh-keygen|ssh-copy-id"
+      action: deny
+      reason: "🚨 CRITICAL: SSH key generation/deployment blocked"
+    
+    # SSH authorized_keys manipulation
+    - pattern: ">>?\\s*.*authorized_keys|echo.*ssh-(rsa|ed25519|ecdsa).*>>"
+      action: deny
+      reason: "🚨 CRITICAL: SSH authorized_keys manipulation"
 
   whitelist:
     # Read-only inspection (safe)
@@ -301,22 +311,8 @@ command_rules:
 file_rules:
   allowed_paths:
     # Workspace directories
-    - ~/.openclaw/workspace/**
-    - ~/.clawguard/**
-    - ~/Projects/**
-    - ~/Documents/**
-    - ~/Downloads/**
-    - /tmp/**
+    - ~/work
     
-    # Development directories (read-only for most operations)
-    - ~/code/**
-    - ~/dev/**
-    - ~/work/**
-    
-    # Config files (with caution)
-    - ~/.openclaw/*.json
-    - ~/.openclaw/*.yaml
-    - ~/.config/openclaw/**
 
   denied_paths:
     # Credentials & secrets
@@ -363,7 +359,13 @@ file_rules:
     - ~/.thunderbird/**
     - ~/.config/Signal/**
     - ~/.config/Telegram/**
-
+    
+    # ClawGuard — protect its own internals
+    - ~/.clawguard/**
+    - ~/clawguard-py/**
+    - ~/target_clawguard/**
+    - ~/.openclaw/openclaw.json
+    
   sensitive_patterns:
     # Private keys
     - "*.pem"
@@ -411,11 +413,6 @@ file_rules:
 # ============================================
 network_rules:
   allowed_domains:
-    # Development resources
-    - api.github.com
-    - github.com
-    - raw.githubusercontent.com
-    - gist.github.com
     
     # Package registries
     - registry.npmjs.org
@@ -428,7 +425,6 @@ network_rules:
     # AI APIs
     - api.openai.com
     - api.anthropic.com
-    - generativelanguage.googleapis.com
     
     # Documentation
     - docs.python.org
@@ -612,6 +608,10 @@ sanitizer_rules:
     private_key_generic:
       pattern: "-----BEGIN PRIVATE KEY-----[\\s\\S]{1,4096}?-----END PRIVATE KEY-----"
       replacement: "[PRIVATE_KEY_REDACTED]"
+    
+    ssh_public_key:
+      pattern: "ssh-(rsa|ed25519|ecdsa|dsa)\\s+[A-Za-z0-9+/=]{40,}"
+      replacement: "[SSH_PUBLIC_KEY_REDACTED]"
     
     # ========== Database Credentials ==========
     

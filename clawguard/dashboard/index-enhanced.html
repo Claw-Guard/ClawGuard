@@ -246,6 +246,50 @@
 
         <!-- Rule Management Tab -->
         <div class="tab-content" id="rules-tab">
+            <!-- Download Rules Bar -->
+            <div style="display: flex; gap: 0.5rem; margin-bottom: 1rem; justify-content: flex-end;">
+                <button class="btn btn-small" id="btn-download-rules" style="background: #1da1f2;">📥 Download All Rules (JSON)</button>
+            </div>
+
+            <!-- Task Scope Banner -->
+            <div class="card card-wide" id="task-scope-card" style="margin-bottom: 1rem;">
+                <div class="card-header" style="display: flex; justify-content: space-between; align-items: center;">
+                    <h3>🎯 Active Task Scope</h3>
+                    <div style="display: flex; gap: 0.5rem; align-items: center;">
+                        <button id="task-scope-lock-btn" class="btn btn-warning" style="padding: 4px 12px; font-size: 0.8rem;" onclick="toggleTaskScopeLock()">🔒 Base Rules Only</button>
+                        <button id="clear-scope-btn" class="btn btn-danger" style="display: none; padding: 4px 12px; font-size: 0.8rem;" onclick="clearTaskScope()">✕ Clear Scope</button>
+                        <span class="badge" id="task-scope-badge" style="background: #657786;">Inactive</span>
+                    </div>
+                </div>
+                <div class="card-body" id="task-scope-body">
+                    <p class="empty-list" id="task-scope-inactive">No task scope active — agent has not declared per-task restrictions.</p>
+                    <div id="task-scope-details" style="display: none;">
+                        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 1rem;">
+                            <div>
+                                <h4 style="margin: 0 0 0.5rem; font-size: 0.9rem; color: #657786;">📖 File Read</h4>
+                                <div class="rule-list" id="task-scope-file-read" style="max-height: 150px;"></div>
+                            </div>
+                            <div>
+                                <h4 style="margin: 0 0 0.5rem; font-size: 0.9rem; color: #657786;">✏️ File Write</h4>
+                                <div class="rule-list" id="task-scope-file-write" style="max-height: 150px;"></div>
+                            </div>
+                            <div>
+                                <h4 style="margin: 0 0 0.5rem; font-size: 0.9rem; color: #657786;">⚡ Commands</h4>
+                                <div class="rule-list" id="task-scope-commands" style="max-height: 150px;"></div>
+                            </div>
+                            <div>
+                                <h4 style="margin: 0 0 0.5rem; font-size: 0.9rem; color: #657786;">🌐 Network</h4>
+                                <div class="rule-list" id="task-scope-network" style="max-height: 150px;"></div>
+                            </div>
+                        </div>
+                        <div id="task-scope-disabled-tools" style="margin-top: 0.75rem; display: none;">
+                            <h4 style="margin: 0 0 0.5rem; font-size: 0.9rem; color: #e0245e;">🚫 Disabled Tools</h4>
+                            <div class="rule-list" id="task-scope-disabled-list" style="max-height: 100px;"></div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
             <div class="grid">
                 <!-- Network Rules -->
                 <div class="card">

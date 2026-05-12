@@ -1,0 +1,29 @@
+{
+  "name": "clawguard",
+  "version": "1.0.0",
+  "description": "ClawGuard Security Engine OpenClaw Plugin — Intercept dangerous operations, audit all actions, protect sensitive data",
+  "main": "index.js",
+  "type": "module",
+  "keywords": ["openclaw", "openclaw-plugin", "security", "clawguard", "audit", "mcp", "agent-safety"],
+  "license": "MIT",
+  "homepage": "https://www.clawguard.site",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/user/clawguard"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "openclaw": {
+    "extensions": ["./index.js"],
+    "compat": {
+      "pluginApi": ">=2026.3.24-beta.2",
+      "minGatewayVersion": "2026.3.24-beta.2"
+    }
+  },
+  "files": [
+    "index.js",
+    "SKILL.md",
+    "openclaw.plugin.json"
+  ]
+}

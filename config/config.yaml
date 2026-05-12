@@ -15,6 +15,7 @@ mcp:
 policy:
   mode: permissive  # strict, permissive, supervised
   approval_timeout: 60
+  timeout_action: deny  # "allow" or "deny" — what happens when approval times out
   rules_file: config/rules.yaml
   hot_reload: true
 

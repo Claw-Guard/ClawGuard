@@ -270,8 +270,7 @@ body {
 
 .approval-item {
     display: flex;
-    justify-content: space-between;
-    align-items: center;
+    flex-direction: column;
     padding: 12px;
     background: var(--darker);
     border-radius: 6px;
@@ -280,6 +279,7 @@ body {
 
 .approval-info {
     flex: 1;
+    margin-bottom: 8px;
 }
 
 .approval-type {
@@ -291,11 +291,25 @@ body {
     font-family: monospace;
     font-size: 13px;
     color: var(--text-muted);
+    max-height: 80px;
+    overflow-y: auto;
+    word-break: break-all;
+    white-space: pre-wrap;
+    background: rgba(0,0,0,0.15);
+    padding: 8px;
+    border-radius: 4px;
+    margin-top: 4px;
+    cursor: pointer;
+}
+
+.approval-operation.expanded {
+    max-height: none;
 }
 
 .approval-actions {
     display: flex;
     gap: 8px;
+    flex-shrink: 0;
 }
 
 /* Badge */

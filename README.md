@@ -10,6 +10,10 @@
 
 ---
 
+> **Note:** Due to breaking changes in the OpenClaw plugin API, this repository now ships two plugin variants (`legacy` for OpenClaw < 2026.5.7, `v5` for OpenClaw ≥ 2026.5.7). The installer detects your version automatically, but edge cases may exist. If you run into issues, please [open an issue](https://github.com/Claw-Guard/ClawGuard/issues).
+
+---
+
 ## How ClawGuard Works
 
 ```
@@ -37,8 +41,17 @@ ClawGuard operates as a **sidecar daemon** — no model modification, no infrast
 |-------|-----------|
 | **L1 — Gateway Tool Block** | Native `exec`/`write`/`edit` tools disabled at the OpenClaw gateway layer; agent can only use `cg_*` tools |
 | **L2 — Rule Engine** | Every `cg_*` call checked against command blacklists, file path controls, and domain allowlists |
-| **L3 — Sanitizer Engine** | 15 categories of sensitive data (API keys, tokens, SSH keys) stripped bidirectionally from tool I/O before entering conversation history |
-| **L4 — Audit Log** | All operations recorded to a local SQLite database; tamper-proof, exportable |
+| **L3 — Sanitizer Engine** | 30+ regex patterns covering API keys, tokens, SSH keys, DB credentials, and crypto keys — stripped bidirectionally from tool I/O before entering conversation history |
+| **L4 — Audit Log** | All operations recorded to a local SQLite database (`~/.clawguard/audit.db`); exportable from the dashboard |
+
+---
+
+## Requirements
+
+- Python 3.9+
+- Node.js 18+
+- Git
+- [OpenClaw](https://openclaw.ai)
 
 ---
 
@@ -59,13 +72,13 @@ bash install.sh
 ```
 
 The installer will:
-1. Ask where to install (default: `~/clawguard-py`)
-2. Create a Python venv and install dependencies
-3. Copy config templates to `~/.clawguard/`
-4. Install the OpenClaw plugin to `~/.clawguard/openclaw-plugin/`
-5. Install the OpenClaw config transform tool
 
-**Requirements:** Python 3.9+, Node.js 18+, Git, [OpenClaw](https://openclaw.ai)
+1. Detect your OpenClaw version and select the correct plugin variant (`legacy` or `v5`)
+2. Ask where to install (default: `~/clawguard-py`)
+3. Create a Python venv and install dependencies
+4. Copy config templates to `~/.clawguard/` (skipped if already present)
+5. Install the matching OpenClaw plugin to `~/.clawguard/openclaw-plugin/`
+6. Make `bin/` scripts executable and patch `CLAWGUARD_DIR` into them
 
 ---
 
@@ -78,11 +91,12 @@ The installer will:
 ```
 
 This will:
-- Start the ClawGuard daemon (via `nohup`, logs to `~/.clawguard/daemon.log`)
-- Back up your current `openclaw.json` as `openclaw_guardback.json`
-- Patch your OpenClaw config to enable the plugin and block native tools
-- Install the ClawGuard skill into `~/.openclaw/skills/`
-- Restart the OpenClaw gateway
+
+1. Start the ClawGuard daemon via `nohup` (logs to `~/.clawguard/daemon.log`, PID at `~/.clawguard/daemon.pid`)
+2. Back up your current `openclaw.json` as `openclaw_guardback.json`
+3. Patch your OpenClaw config via `transform.js` to enable the plugin and block native tools
+4. Install `SKILL.md` into `~/.openclaw/skills/clawguard/` and sync it to `~/.clawguard/openclaw-plugin/`
+5. Restart the OpenClaw gateway
 
 ### Disable ClawGuard
 
@@ -91,20 +105,22 @@ This will:
 ```
 
 This will:
-- Remove the ClawGuard skill from `~/.openclaw/skills/`
-- Stop the daemon
-- Restore your original `openclaw.json` from backup
-- Restart the OpenClaw gateway
+
+1. Remove `~/.openclaw/skills/` (the ClawGuard skill directory)
+2. Stop the daemon (by PID file, or by process name as fallback)
+3. Roll back `openclaw.json` using `rollback.js` (falls back to the backup copy if `rollback.js` is missing)
+4. Restart the OpenClaw gateway
 
 ### Dashboard
 
-Once running, open: **http://127.0.0.1:19821**
+Once the daemon is running, open: **http://127.0.0.1:19821**
 
 The dashboard provides:
 - Real-time operation timeline
-- Pending approval queue (approve/deny supervised operations)
+- Pending approval queue (approve / deny supervised operations)
+- Rule management — add or remove file path and network domain rules at runtime
 - Audit log with export
-- One-click Panic (emergency block all operations)
+- One-click Panic (emergency block all operations) and Resume
 
 ---
 
@@ -113,9 +129,23 @@ The dashboard provides:
 ### `~/.clawguard/config.yaml`
 
 ```yaml
+daemon:
+  api_port: 19821
+  log_level: info
+
 policy:
-  mode: supervised     # strict | supervised | permissive
-  approval_timeout: 60 # seconds to wait for human approval
+  mode: permissive        # strict | supervised | permissive
+  approval_timeout: 60    # seconds to wait for human approval
+  timeout_action: deny    # what happens when approval times out: "allow" or "deny"
+
+audit:
+  db_path: ~/.clawguard/audit.db
+  retention_days: 90
+
+sanitizer:
+  enabled: true
+  input_sanitization: true
+  output_sanitization: true
 ```
 
 | Mode | Behaviour |
@@ -126,23 +156,69 @@ policy:
 
 ### `~/.clawguard/rules.yaml`
 
-Define file path allowlists/blocklists, command patterns, and network domain controls. See [`config/rules.yaml`](config/rules.yaml) for the full template.
+Controls three rule categories. See [`config/rules.yaml`](config/rules.yaml) for the full template.
+
+**Command rules** — `blacklist` / `whitelist` / `supervised` regex patterns:
+- Blacklisted: destructive deletions, reverse shells, credential theft, fork bombs, disk operations, persistence mechanisms
+- Whitelisted: read-only inspection (`ls`, `cat`, `git status`, `pip list`, etc.)
+- Supervised (require approval): `rm`, `sudo`, `chmod`, HTTP write operations, package installs, git write ops
+
+**File rules** — `allowed_paths` / `denied_paths` / `sensitive_patterns`:
+- Denied by default: `~/.ssh`, `~/.aws`, `~/.gnupg`, `/etc/shadow`, browser profiles, password managers, ClawGuard's own internals
+- Sensitive filename patterns: `*.pem`, `*.key`, `.env*`, `*password*`, `*.sql`, etc.
+
+**Network rules** — `allowed_domains` / `denied_domains`:
+- Allowed: package registries (PyPI, npm, crates.io), AI APIs, documentation sites
+- Denied: paste sites, tunneling services (ngrok, localtunnel), URL shorteners, `.onion`/`.i2p`
+- Default action for unlisted domains: `approve`
+
+Rules support runtime modification via the REST API or dashboard without restarting the daemon.
 
 ---
 
-## Security Tools (for agents)
+## REST API
+
+The daemon exposes a REST API on port `19821`. Key endpoints:
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `GET` | `/rules/list` | Get all current runtime rules |
+| `POST` | `/rules/network/allow?domain=` | Add domain to network allowlist |
+| `DELETE` | `/rules/network/allow/{domain}` | Remove domain from allowlist |
+| `POST` | `/rules/network/deny?domain=` | Add domain to blocklist |
+| `DELETE` | `/rules/network/deny/{domain}` | Remove domain from blocklist |
+| `POST` | `/rules/file/allow?path=` | Add path to file allowlist |
+| `DELETE` | `/rules/file/allow?path=` | Remove path from allowlist |
+| `POST` | `/rules/file/deny?path=` | Add path to file blocklist |
+| `DELETE` | `/rules/file/deny?path=` | Remove path from blocklist |
+| `POST` | `/task-scope/lock` | Lock task scope (freeze rules) |
+| `POST` | `/task-scope/unlock` | Unlock task scope |
+| `POST` | `/task-scope/clear` | Clear task scope rules |
+| `GET` | `/audit` | Query audit log |
+| `GET` | `/audit/download` | Download audit log |
+| `POST` | `/panic` | Trigger emergency block |
+| `POST` | `/resume` | Resume after panic |
+| `GET` | `/status` | Daemon status and stats |
+
+---
+
+## Agent Tools (`cg_*`)
 
 When ClawGuard is active, the agent uses `cg_*` tools instead of native tools:
 
-| `cg_*` Tool | Replaces | Protection |
-|-------------|----------|------------|
+| Tool | Replaces | Protection |
+|------|----------|------------|
 | `cg_execute_command` | `exec` / `process` | Command blacklist + output sanitization |
 | `cg_read_file` | `read` | Sensitive path blocking + content sanitization |
-| `cg_write_file` | `write` / `edit` | Path access control + write sanitization |
+| `cg_write_file` | `write` | Path access control + write sanitization |
+| `cg_edit_file` | `edit` | Path access control + write sanitization |
 | `cg_list_directory` | `read` (dir) | Directory access control |
 | `cg_http_request` | network tools | Domain allowlist + exfiltration prevention |
+| `cg_set_task_scope` | — | Define allowed paths/domains for current task |
+| `cg_clear_task_scope` | — | Clear task scope |
+| `cg_skill_check` | — | Verify skill is on the allowlist |
 | `cg_status` | — | View engine status and audit stats |
-| `cg_panic` | — | 🚨 Emergency block all operations |
+| `cg_panic` | — | Emergency block all operations |
 | `cg_resume` | — | Resume after panic |
 
 ---
@@ -150,33 +226,42 @@ When ClawGuard is active, the agent uses `cg_*` tools instead of native tools:
 ## Project Structure
 
 ```
-ClawGuard/
-├── install.sh                  # One-step installer
-├── main.py                     # Daemon entry point
+clawguard-py/
+├── install.sh                    # Installer with OpenClaw version detection
+├── main.py                       # Daemon entry point
 ├── requirements.txt
-├── clawguard/                  # Python daemon
-│   ├── api.py                  # FastAPI REST + SSE server
-│   ├── approval.py             # Human-in-the-loop approval queue
-│   ├── audit.py                # SQLite audit logger
-│   ├── rules.py                # Rule engine (allow/deny/approve)
-│   ├── sanitizer.py            # Bidirectional I/O sanitizer
-│   ├── normalizer.py           # Input normalizer
-│   ├── panic.py                # Emergency panic/resume
-│   ├── skill_check.py          # Skill allowlist checker
-│   ├── cli.py                  # CLI interface
-│   └── dashboard/              # Web dashboard (HTML/JS/CSS)
-├── config/                     # Config templates
-│   ├── config.yaml
-│   └── rules.yaml
-├── openclaw-plugin/            # OpenClaw plugin
-│   ├── index.js                # Plugin entry point
-│   ├── openclaw.plugin.json    # Plugin manifest
-│   └── SKILL.md                # Agent skill definition
+├── setup.py / pyproject.toml
+├── clawguard/                    # Python daemon
+│   ├── api.py                    # FastAPI REST + SSE server (port 19821)
+│   ├── approval.py               # Human-in-the-loop approval queue
+│   ├── audit.py                  # SQLite audit logger
+│   ├── rules.py                  # Rule engine (allow / deny / approve)
+│   ├── sanitizer.py              # Bidirectional I/O sanitizer (30+ patterns)
+│   ├── normalizer.py             # Input normalizer
+│   ├── panic.py                  # Emergency panic / resume
+│   ├── skill_check.py            # Skill allowlist checker
+│   ├── cli.py                    # CLI interface
+│   └── dashboard/                # Web dashboard (HTML / JS / CSS)
+├── config/
+│   ├── config.yaml               # Daemon configuration template
+│   └── rules.yaml                # Security rules template
+├── openclaw-plugin/
+│   ├── legacy/                   # Plugin for OpenClaw < 2026.5.7
+│   │   ├── index.js
+│   │   ├── SKILL.md
+│   │   ├── openclaw.plugin.json
+│   │   └── package.json
+│   └── v5/                       # Plugin for OpenClaw >= 2026.5.7
+│       ├── index.js              # Uses definePluginEntry() SDK pattern
+│       ├── SKILL.md
+│       ├── openclaw.plugin.json
+│       └── package.json
 ├── bin/
-    ├── enable-clawguard.sh     # Enable + start
-    ├── disable-clawguard.sh    # Disable + restore
-    └── clawguard-shell         # Shell wrapper
-
+│   ├── enable-clawguard.sh       # Enable + start daemon
+│   ├── disable-clawguard.sh      # Disable + restore config
+│   ├── clawguard-shell           # Shell wrapper
+│   ├── transform.js              # OpenClaw config patcher
+│   └── rollback.js               # OpenClaw config rollback
 ```
 
 ---
@@ -187,13 +272,13 @@ If you use ClawGuard in your research, please cite:
 
 ```bibtex
 @misc{clawguard2026,
-  title  = {A Runtime Security Framework for Tool-Augmented LLM Agents Against Indirect Prompt Injection},
-  author = {Wei Zhao et al.},
-  year   = {2026},
-  eprint = {2604.11790},
+  title         = {A Runtime Security Framework for Tool-Augmented LLM Agents Against Indirect Prompt Injection},
+  author        = {Wei Zhao et al.},
+  year          = {2026},
+  eprint        = {2604.11790},
   archivePrefix = {arXiv},
   primaryClass  = {cs.CR},
-  url    = {https://arxiv.org/abs/2604.11790}
+  url           = {https://arxiv.org/abs/2604.11790}
 }
 ```
 

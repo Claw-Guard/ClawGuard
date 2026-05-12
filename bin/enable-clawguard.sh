@@ -5,20 +5,22 @@
 #   1. Activate venv and start the ClawGuard daemon with nohup
 #   2. Backup current openclaw.json as openclaw_guardback.json
 #   3. Apply ClawGuard config via transform.js
-#   4. Copy SKILL.md into ~/.openclaw/skills/
+#   4. Copy SKILL.md into ~/.openclaw/skills/clawguard/
 #   5. Restart OpenClaw gateway
 
 set -e
 
-CLAWGUARD_DIR="$HOME/clawguard-py"  # patched by install.sh
+CLAWGUARD_DIR="/home/amadeus/clawguard-py"  # patched by install.sh
 VENV="$CLAWGUARD_DIR/venv/bin/activate"
 OPENCLAW_DIR="$HOME/.openclaw"
 OPENCLAW_JSON="$OPENCLAW_DIR/openclaw.json"
 BACKUP_JSON="$OPENCLAW_DIR/openclaw_guardback.json"
 SKILLS_DIR="$OPENCLAW_DIR/skills"
-SKILL_SRC="$HOME/.clawguard/openclaw-plugin/SKILL.md"
-TRANSFORM_SCRIPT="$HOME/.openclaw/workspace/tests/transform.js"
-TRANSFORMED_JSON="$HOME/.openclaw/workspace/tests/openclaw.transformed.json"
+SKILL_DEST_DIR="$SKILLS_DIR/clawguard"
+INSTALLED_PLUGIN_DIR="$HOME/.clawguard/openclaw-plugin"
+SKILL_SRC="$INSTALLED_PLUGIN_DIR/SKILL.md"
+TRANSFORM_SCRIPT="$CLAWGUARD_DIR/bin/transform.js"
+TRANSFORMED_JSON="$OPENCLAW_DIR/openclaw.clawguard.json"
 LOG_FILE="$HOME/.clawguard/daemon.log"
 PID_FILE="$HOME/.clawguard/daemon.pid"
 
@@ -109,9 +111,9 @@ echo ""
 
 echo "[4/5] Installing ClawGuard skill..."
 
-mkdir -p "$SKILLS_DIR"
-cp "$SKILL_SRC" "$SKILLS_DIR/SKILL.md"
-echo "  ✅ SKILL.md copied to $SKILLS_DIR/SKILL.md"
+mkdir -p "$SKILL_DEST_DIR"
+cp "$SKILL_SRC" "$SKILL_DEST_DIR/SKILL.md"
+echo "  ✅ SKILL.md copied to $SKILL_DEST_DIR/SKILL.md"
 echo ""
 
 # ── Step 5: Restart OpenClaw gateway ─────────────────────────────────────────

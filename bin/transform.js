@@ -134,7 +134,7 @@ function applyAgents(cfg) {
   }
 
   // deny native tools
-  const nativeDeny = ["exec", "write", "edit", "apply_patch", "process"];
+  const nativeDeny = ["exec", "read", "write", "edit", "apply_patch", "process", "web_fetch", "browser","web_search"];
   if (!mainAgent.tools.deny) mainAgent.tools.deny = [];
   for (const t of nativeDeny) {
     if (!mainAgent.tools.deny.includes(t)) {
