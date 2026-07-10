@@ -13,6 +13,7 @@ from clawguard.approval import ApprovalQueue
 from clawguard.panic import PanicManager
 from clawguard.skill_check import SkillChecker
 from clawguard.script_analyzer import ScriptAnalyzer, ScriptAnalysisResult, ScriptRisk
+from clawguard.api import RuleBuilder, CompiledRule
 
 __all__ = [
     "Sanitizer",
@@ -24,4 +25,6 @@ __all__ = [
     "ScriptAnalyzer",
     "ScriptAnalysisResult",
     "ScriptRisk",
+    "RuleBuilder",
+    "CompiledRule",
 ]
