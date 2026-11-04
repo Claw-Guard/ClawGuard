@@ -436,6 +436,3 @@ On Windows, activate the environment with:
 ```powershell
 .\.venv\Scripts\Activate.ps1
 ```
-
-The detailed security design is in
-[`CLAWGUARD_ARCHITECTURE_AND_SECURITY.md`](CLAWGUARD_ARCHITECTURE_AND_SECURITY.md).
