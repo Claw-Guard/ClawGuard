@@ -1,6 +1,12 @@
-# ClawGuard
+# 🛡️ ClawGuard
 
-**ClawGuard enforces a user-confirmed rule set at every tool-call boundary, transforming unreliable alignment-dependent defense into a deterministic, auditable mechanism that intercepts adversarial tool calls before any real-world effect is produced.**
+**A Runtime Security Framework for Tool-Augmented LLM Agents Against Indirect Prompt Injection**
+
+[![arXiv](https://img.shields.io/badge/arXiv-2604.11790-b31b1b.svg)](https://arxiv.org/abs/2604.11790)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/)
+
+> **ClawGuard enforces a user-confirmed rule set at every tool-call boundary, transforming unreliable alignment-dependent defense into a deterministic, auditable mechanism that intercepts adversarial tool calls before any real-world effect is produced.**
 
 ClawGuard implements that guarantee as an Agent-agnostic API gateway: it runs
 locally between an Agent and its model provider, inspects every tool-call
