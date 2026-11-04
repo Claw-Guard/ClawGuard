@@ -4,14 +4,17 @@ Handles operations requiring approval, supports REST API and SSE real-time push
 """
 
 import asyncio
+import os
 import time
 import uuid
+import sqlite3
 from typing import Optional, List, Dict, Any, Callable
 from dataclasses import dataclass, field
 from enum import Enum
 from datetime import datetime
 import json
 from collections import OrderedDict
+from contextlib import closing
 from sse_starlette.sse import EventSourceResponse
 
 
@@ -21,6 +24,7 @@ class ApprovalStatus(Enum):
     APPROVED = "approved"
     DENIED = "denied"
     TIMEOUT = "timeout"
+    INTERRUPTED = "interrupted"
 
 
 class ApprovalType(Enum):
@@ -30,6 +34,7 @@ class ApprovalType(Enum):
     FILE_READ_SENSITIVE = "file_read_sensitive"
     NETWORK = "network"
     SKILL = "skill"
+    TOOL_CALL = "tool_call"
 
 
 @dataclass
@@ -79,6 +84,7 @@ class ApprovalQueue:
         self,
         timeout_seconds: int = 60,
         max_queue_size: int = 100,
+        db_path: Optional[str] = None,
     ):
         """
         InitializeApproval Queue
@@ -89,6 +95,12 @@ class ApprovalQueue:
         """
         self.timeout_seconds = timeout_seconds
         self.max_queue_size = max_queue_size
+        self.boot_id = uuid.uuid4().hex
+        self.db_path = (
+            os.path.expanduser(db_path)
+            if db_path
+            else os.path.expanduser("~/.clawguard/approval_history.db")
+        )
         
         # PendingApproval Queue（Ordered dict, sorted by time）
         self._pending: OrderedDict[str, ApprovalRequest] = OrderedDict()
@@ -101,6 +113,89 @@ class ApprovalQueue:
         
         # Callback function
         self._on_resolution: Optional[Callable] = None
+        self._init_history_db()
+
+    def _history_connection(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(self.db_path, timeout=10)
+        conn.row_factory = sqlite3.Row
+        return conn
+
+    def _init_history_db(self) -> None:
+        db_dir = os.path.dirname(self.db_path)
+        if db_dir:
+            os.makedirs(db_dir, exist_ok=True)
+        with closing(self._history_connection()) as conn:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS approval_history (
+                    id TEXT PRIMARY KEY,
+                    boot_id TEXT NOT NULL,
+                    created_at REAL NOT NULL,
+                    approval_type TEXT NOT NULL,
+                    operation TEXT NOT NULL,
+                    reason TEXT,
+                    details TEXT,
+                    status TEXT NOT NULL,
+                    resolved_at REAL,
+                    resolved_by TEXT,
+                    resolution_reason TEXT
+                )
+                """
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_approval_created "
+                "ON approval_history(created_at)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_approval_boot "
+                "ON approval_history(boot_id)"
+            )
+            conn.execute(
+                """
+                UPDATE approval_history
+                SET status = ?,
+                    resolved_at = ?,
+                    resolution_reason = ?
+                WHERE status = ? AND boot_id <> ?
+                """,
+                (
+                    ApprovalStatus.INTERRUPTED.value,
+                    time.time(),
+                    "ClawGuard restarted before approval resolution",
+                    ApprovalStatus.PENDING.value,
+                    self.boot_id,
+                ),
+            )
+            conn.commit()
+        try:
+            os.chmod(self.db_path, 0o600)
+        except OSError:
+            pass
+
+    def _persist_request(self, request: ApprovalRequest) -> None:
+        with closing(self._history_connection()) as conn:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO approval_history
+                (id, boot_id, created_at, approval_type, operation, reason,
+                 details, status, resolved_at, resolved_by, resolution_reason)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    request.id,
+                    self.boot_id,
+                    request.created_at,
+                    request.approval_type,
+                    request.operation,
+                    request.reason,
+                    json.dumps(request.details, ensure_ascii=False),
+                    request.status,
+                    request.resolved_at,
+                    request.resolved_by,
+                    request.resolution_reason,
+                ),
+            )
+            conn.commit()
     
     def set_on_resolution(self, callback: Callable):
         """Result"""
@@ -131,7 +226,8 @@ class ApprovalQueue:
             reason=reason,
             details=details or {},
         )
-        
+
+        self._persist_request(request)
         self._pending[request.id] = request
         
         # Subscribers
@@ -167,7 +263,7 @@ class ApprovalQueue:
         Returns:
             Approval Request
         """
-        request = self._pending.pop(request_id, None)
+        request = self._pending.get(request_id)
         if not request:
             return None
         
@@ -175,6 +271,8 @@ class ApprovalQueue:
         request.resolved_at = time.time()
         request.resolved_by = resolved_by
         request.resolution_reason = reason
+        self._persist_request(request)
+        self._pending.pop(request_id, None)
         
         # History
         self._history.append(request)
@@ -211,7 +309,7 @@ class ApprovalQueue:
         Returns:
             Approval Request
         """
-        request = self._pending.pop(request_id, None)
+        request = self._pending.get(request_id)
         if not request:
             return None
         
@@ -219,6 +317,8 @@ class ApprovalQueue:
         request.resolved_at = time.time()
         request.resolved_by = resolved_by
         request.resolution_reason = reason
+        self._persist_request(request)
+        self._pending.pop(request_id, None)
         
         # History
         self._history.append(request)
@@ -269,6 +369,7 @@ class ApprovalQueue:
             request.status = ApprovalStatus.TIMEOUT.value
             request.resolved_at = time.time()
             request.resolution_reason = f"Approval timed out after {timeout}s"
+            self._persist_request(request)
             self._history.append(request)
             await self._broadcast({"event": "timeout", "data": request.to_dict()})
 
@@ -285,6 +386,43 @@ class ApprovalQueue:
     def get_history(self, limit: int = 50) -> List[ApprovalRequest]:
         """History"""
         return self._history[-limit:]
+
+    def get_persisted_history(
+        self,
+        limit: int = 100,
+        offset: int = 0,
+        include_previous_runs: bool = False,
+    ) -> List[Dict[str, Any]]:
+        """Read approval records from persistent storage."""
+        where = "" if include_previous_runs else "WHERE boot_id = ?"
+        params: List[Any] = [] if include_previous_runs else [self.boot_id]
+        params.extend([limit, offset])
+        with closing(self._history_connection()) as conn:
+            rows = conn.execute(
+                f"""
+                SELECT * FROM approval_history
+                {where}
+                ORDER BY created_at DESC
+                LIMIT ? OFFSET ?
+                """,
+                params,
+            ).fetchall()
+        result = []
+        for row in rows:
+            item = dict(row)
+            try:
+                item["details"] = json.loads(item.get("details") or "{}")
+            except (TypeError, ValueError):
+                item["details"] = {}
+            item["created_at_human"] = datetime.fromtimestamp(
+                item["created_at"]
+            ).isoformat()
+            if item.get("resolved_at"):
+                item["resolved_at_human"] = datetime.fromtimestamp(
+                    item["resolved_at"]
+                ).isoformat()
+            result.append(item)
+        return result
     
     def get_stats(self) -> Dict[str, Any]:
         """Information"""
@@ -322,6 +460,7 @@ class ApprovalQueue:
             request.status = ApprovalStatus.TIMEOUT.value
             request.resolved_at = now
             request.resolution_reason = "Approval timeout"
+            self._persist_request(request)
             self._history.append(request)
             
             await self._broadcast({

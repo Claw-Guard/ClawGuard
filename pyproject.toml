@@ -4,19 +4,19 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "clawguard"
-version = "1.0.0"
-description = "ClawGuard: Runtime Security Framework for Tool-Augmented LLM Agents Against Indirect Prompt Injection"
+version = "2026.11.3"
+description = "ClawGuard: an Agent-agnostic API gateway for deterministic tool-call security"
 readme = "README.md"
-license = {text = "MIT"}
+license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.10"
 authors = [
-    {name = "Friday AI Assistant"}
+    {name = "ClawGuard Contributors"}
 ]
 keywords = ["ai", "agent", "security", "sandbox", "guard"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
-    "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",

@@ -194,12 +194,39 @@ _SHELL_PATTERNS: List[Tuple[str, str, str, str]] = [
 # ─────────────────────────────────────────────────────────────────────────────
 
 # Regex to extract file paths from source code (Python open(), shell redirects, etc.)
-_SOURCE_PATH_RE = re.compile(
-    r'''(?:open|file)\s*\(\s*['"](?P<path>[^'"]+)['"]'''   # open("/path")
-    r'''|(?:^|\s)(?P<shpath>/(?:etc|root|home|var|usr|opt)[^\s'"\)\|;&>]+)'''  # /etc/… /home/… (must have subpath)
-    r'''|['"](?P<tildepath>~/[^'"\s]+)['"]''',            # "~/…" strings
+# Absolute path literals inside source code: POSIX ("/x/y"), home-relative
+# ("~/x"), Windows ("C:\\x", "C:/x") and UNC ("\\\\srv\\share").  An optional
+# string prefix (r/b/f/u) is allowed, so open(r"C:\\secrets\\x") is still seen.
+_SOURCE_PATH_TOKEN_RE = re.compile(
+    r'''[rbfuRBFU]{0,2}['"](?P<quoted>[^'"\n]+)['"]'''
+    r'''|(?:^|[\s=,(])(?P<bare>[^\s'"\)\|;&>,]+)''',
     re.MULTILINE,
 )
+
+_WINDOWS_ABSOLUTE_RE = re.compile(r'^[A-Za-z]:[\\/]')
+_UNC_ABSOLUTE_RE = re.compile(r'^\\\\')
+_HOME_RELATIVE_RE = re.compile(r'^~[\\/]')
+_POSIX_ABSOLUTE_RE = re.compile(r'^/(?!/)')
+
+
+def _looks_like_absolute_path(token: str) -> bool:
+    """Return whether *token* is an absolute path literal worth rule checking.
+
+    URL-looking tokens are rejected.  Single-component targets such as
+    ``/vault`` count, which matters on Linux deployments where a denied
+    directory can sit directly under the root; only explicit rule hits are
+    reported, so URL fragments like ``/v1`` stay harmless.
+    """
+    token = token.strip()
+    if not token or '://' in token or token.startswith('//'):
+        return False
+    if (
+        _WINDOWS_ABSOLUTE_RE.match(token)
+        or _UNC_ABSOLUTE_RE.match(token)
+        or _HOME_RELATIVE_RE.match(token)
+    ):
+        return True
+    return bool(_POSIX_ABSOLUTE_RE.match(token))
 
 # Regex to extract URLs from source code
 _SOURCE_URL_RE = re.compile(
@@ -478,15 +505,17 @@ class ScriptAnalyzer:
 
     def _check_paths_against_rules(self, source: str) -> List[ScriptFinding]:
         """
-        Extract file paths from source and run each through the rule engine's
-        check_file_path().  Reports denied or sensitive paths as findings.
+        Extract absolute path literals from source and run each through the
+        rule engine's check_file_path().  Reports denied or sensitive paths as
+        findings; a path with no explicit rule is left to the tool-call policy
+        so an unrelated literal does not force an approval prompt.
         """
         findings: List[ScriptFinding] = []
         seen: set = set()
 
-        for m in _SOURCE_PATH_RE.finditer(source):
-            path = m.group('path') or m.group('shpath') or m.group('tildepath')
-            if not path or path in seen:
+        for m in _SOURCE_PATH_TOKEN_RE.finditer(source):
+            path = (m.group('quoted') or m.group('bare') or '').strip().rstrip('.,;')
+            if not path or path in seen or not _looks_like_absolute_path(path):
                 continue
             seen.add(path)
 
@@ -502,7 +531,7 @@ class ScriptAnalyzer:
                     severity='critical',
                     evidence=path,
                 ))
-            elif result.action == ActionType.APPROVE:
+            elif result.action == ActionType.APPROVE and result.rule_type != 'file_unknown':
                 findings.append(ScriptFinding(
                     category='file_access',
                     description=f"Script accesses sensitive path: {path} ({result.reason})",

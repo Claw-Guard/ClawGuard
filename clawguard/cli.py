@@ -11,6 +11,7 @@ import time
 import signal
 import subprocess
 import argparse
+from dataclasses import replace
 from pathlib import Path
 from typing import Optional
 
@@ -22,6 +23,7 @@ import httpx
 DEFAULT_CONFIG_DIR = Path.home() / ".clawguard"
 DEFAULT_API_PORT = 19821
 DEFAULT_WEB_PORT = 19821
+DEFAULT_GATEWAY_PORT = 19822
 
 
 class ClawGuardCLI:
@@ -31,7 +33,31 @@ class ClawGuardCLI:
         self.config_dir = config_dir or DEFAULT_CONFIG_DIR
         self.config_file = self.config_dir / "config.yaml"
         self.pid_file = self.config_dir / "daemon.pid"
+        self.gateway_pid_file = self.config_dir / "gateway.pid"
         self.api_url = f"http://127.0.0.1:{DEFAULT_API_PORT}"
+
+    def _gateway_endpoint(self) -> str:
+        """Read the gateway bind address from config without starting it."""
+        host = "127.0.0.1"
+        port = DEFAULT_GATEWAY_PORT
+        if self.config_file.exists():
+            try:
+                config = yaml.safe_load(self.config_file.read_text(encoding="utf-8")) or {}
+                gateway = config.get("gateway", {}) if isinstance(config, dict) else {}
+                gateway = gateway if isinstance(gateway, dict) else {}
+                host = str(gateway.get("host", host))
+                port = int(gateway.get("port", port))
+            except (OSError, TypeError, ValueError, yaml.YAMLError):
+                pass
+        return f"http://{host}:{port}"
+
+    def _check_gateway(self) -> bool:
+        """Check the transparent gateway's control endpoint."""
+        try:
+            resp = httpx.get(f"{self._gateway_endpoint()}/api", timeout=2.0)
+            return resp.status_code == 200
+        except Exception:
+            return False
     
     def _get_pid(self) -> Optional[int]:
         """Get daemon PID"""
@@ -103,6 +129,98 @@ class ClawGuardCLI:
         finally:
             if self.pid_file.exists():
                 self.pid_file.unlink()
+
+    def start_gateway(self, save_logs: Optional[bool] = None, log_dir: Optional[str] = None):
+        """Start the transparent OpenAI-compatible gateway on its own PID."""
+        if self._check_gateway():
+            print(f"✅ ClawGuard gateway is already running ({self._gateway_endpoint()})")
+            return
+
+        self.config_dir.mkdir(parents=True, exist_ok=True)
+        import uvicorn
+        from clawguard.gateway import GatewaySettings, create_gateway_app
+
+        config_path = self.config_dir / "config.yaml"
+        rules_path = self.config_dir / "rules.yaml"
+        settings = GatewaySettings.from_files(str(config_path) if config_path.exists() else None)
+        overrides = {}
+        if save_logs is not None:
+            overrides["request_logging"] = save_logs
+        if log_dir is not None:
+            overrides["log_dir"] = log_dir
+        if overrides:
+            settings = replace(settings, **overrides)
+        app = create_gateway_app(
+            config_path=str(config_path) if config_path.exists() else None,
+            rules_path=str(rules_path) if rules_path.exists() else None,
+            settings=settings,
+        )
+
+        self.gateway_pid_file.write_text(str(os.getpid()), encoding="utf-8")
+        print(f"🚀 Starting ClawGuard LLM gateway: http://{settings.host}:{settings.port}")
+        print(f"   Upstream: {settings.upstream_base_url}")
+        if settings.request_logging:
+            print(f"   Request logging: on -> {settings.log_dir}")
+        else:
+            print("   Request logging: off")
+        print("   OpenClaw base URL: http://127.0.0.1:19822/v1")
+        print("Press Ctrl+C to stop")
+        try:
+            uvicorn.run(app, host=settings.host, port=settings.port, log_level="info")
+        finally:
+            if self.gateway_pid_file.exists():
+                self.gateway_pid_file.unlink()
+
+    def stop_gateway(self):
+        """Stop only the gateway process; leave the 19821 daemon untouched."""
+        pid = self._get_pid_file(self.gateway_pid_file)
+        if not pid:
+            print("⚠️  ClawGuard gateway is not running")
+            return
+        try:
+            os.kill(pid, signal.SIGTERM)
+            print("🛑 ClawGuard gateway stopped")
+        except OSError:
+            print("⚠️  Failed to stop ClawGuard gateway")
+        if self.gateway_pid_file.exists():
+            self.gateway_pid_file.unlink()
+
+    def gateway_status(self):
+        """Show transparent gateway status and configured upstream."""
+        endpoint = self._gateway_endpoint()
+        print("🛡️  ClawGuard LLM Gateway\n")
+        if not self._check_gateway():
+            print(f"⚠️  Gateway is not responding at {endpoint}")
+            print("\n  Start with: clawguard gateway start")
+            return
+        try:
+            resp = httpx.get(f"{endpoint}/status", timeout=5.0)
+            data = resp.json()
+            panic = data.get("panic", {})
+            print(f"  Endpoint: {endpoint}")
+            print(f"  Panic:    {'🔴 active' if panic.get('is_panicking') else '🟢 inactive'}")
+            print(f"  Pending approvals: {data.get('approval', {}).get('pending', 0)}")
+            config = yaml.safe_load(self.config_file.read_text(encoding="utf-8")) if self.config_file.exists() else {}
+            config = config if isinstance(config, dict) else {}
+            gateway = config.get("gateway", {})
+            gateway = gateway if isinstance(gateway, dict) else {}
+            print(f"  Agent:    {gateway.get('agent', 'openclaw')}")
+            print(f"  Upstream: {gateway.get('upstream_base_url', 'https://api.openai.com/v1')}")
+            print(
+                "  Upstream format: "
+                f"{gateway.get('upstream_format', 'openai_chat_completion')}"
+            )
+        except Exception as exc:
+            print(f"❌ Failed to query gateway: {exc}")
+
+    @staticmethod
+    def _get_pid_file(path: Path) -> Optional[int]:
+        if not path.exists():
+            return None
+        try:
+            return int(path.read_text(encoding="utf-8").strip())
+        except (OSError, ValueError):
+            return None
     
     def stop(self):
         """Stop daemon"""
@@ -250,14 +368,16 @@ class ClawGuardCLI:
         except Exception as e:
             print(f"❌ : {e}")
     
-    def show_approvals(self):
+    def show_approvals(self, base_url: Optional[str] = None):
         """PendingList"""
-        if not self._check_api():
-            print("⚠️  ClawGuard daemon ")
+        base_url = base_url or self.api_url
+        check = self._check_gateway if base_url == self._gateway_endpoint() else self._check_api
+        if not check():
+            print("⚠️  ClawGuard service is not responding")
             return
         
         try:
-            resp = httpx.get(f"{self.api_url}/approval/pending", timeout=5.0)
+            resp = httpx.get(f"{base_url}/approval/pending", timeout=5.0)
             data = resp.json()
             
             requests = data.get("requests", [])
@@ -273,15 +393,17 @@ class ClawGuardCLI:
         except Exception as e:
             print(f"❌ : {e}")
     
-    def approve(self, request_id: str, reason: str = ""):
+    def approve(self, request_id: str, reason: str = "", base_url: Optional[str] = None):
         """Approve request"""
-        if not self._check_api():
-            print("⚠️  ClawGuard daemon ")
+        base_url = base_url or self.api_url
+        check = self._check_gateway if base_url == self._gateway_endpoint() else self._check_api
+        if not check():
+            print("⚠️  ClawGuard service is not responding")
             return
         
         try:
             resp = httpx.post(
-                f"{self.api_url}/approval/approve",
+                f"{base_url}/approval/approve",
                 json={"request_id": request_id, "resolved_by": "cli", "reason": reason},
                 timeout=5.0,
             )
@@ -290,15 +412,17 @@ class ClawGuardCLI:
         except Exception as e:
             print(f"❌ : {e}")
     
-    def deny(self, request_id: str, reason: str = ""):
+    def deny(self, request_id: str, reason: str = "", base_url: Optional[str] = None):
         """Deny request"""
-        if not self._check_api():
-            print("⚠️  ClawGuard daemon ")
+        base_url = base_url or self.api_url
+        check = self._check_gateway if base_url == self._gateway_endpoint() else self._check_api
+        if not check():
+            print("⚠️  ClawGuard service is not responding")
             return
         
         try:
             resp = httpx.post(
-                f"{self.api_url}/approval/deny",
+                f"{base_url}/approval/deny",
                 json={"request_id": request_id, "resolved_by": "cli", "reason": reason},
                 timeout=5.0,
             )
@@ -344,6 +468,16 @@ class ClawGuardCLI:
 
 def main():
     """CLI Entry point"""
+    # Windows consoles may still default to a legacy code page that cannot
+    # render the status icons used by the CLI.  Keep the human-readable output
+    # while making the command usable without requiring PYTHONIOENCODING.
+    if os.name == "nt":
+        for stream in (sys.stdout, sys.stderr):
+            try:
+                stream.reconfigure(encoding="utf-8", errors="replace")
+            except (AttributeError, OSError):
+                pass
+
     parser = argparse.ArgumentParser(
         description="🛡️ ClawGuard - AI Agent Security Framework",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -354,6 +488,31 @@ def main():
     # daemon Command
     daemon_parser = subparsers.add_parser("daemon", help=" Daemon ")
     daemon_parser.add_argument("action", choices=["start", "stop", "status"], help="Operation")
+
+    # transparent LLM gateway (kept separate from the 19821 control daemon)
+    gateway_parser = subparsers.add_parser(
+        "gateway",
+        help="Start/stop the transparent OpenAI-compatible LLM gateway",
+    )
+    gateway_parser.add_argument("action", choices=["start", "stop", "status"], help="Operation")
+    gateway_parser.add_argument(
+        "--save-logs",
+        dest="save_logs",
+        action="store_true",
+        default=None,
+        help="Save every forwarded LLM request as timestamped JSON + plain text",
+    )
+    gateway_parser.add_argument(
+        "--no-save-logs",
+        dest="save_logs",
+        action="store_false",
+        help="Disable request logging for this run",
+    )
+    gateway_parser.add_argument(
+        "--log-dir",
+        default=None,
+        help="Directory for request logs (default: logs)",
+    )
     
     # panic Command
     panic_parser = subparsers.add_parser("panic", help="🚨 ")
@@ -381,6 +540,11 @@ def main():
     approval_parser.add_argument("action", choices=["list", "approve", "deny"], help="Operation")
     approval_parser.add_argument("--id", "-i", help=" ID")
     approval_parser.add_argument("--reason", "-r", default="", help="Reason")
+    approval_parser.add_argument(
+        "--gateway",
+        action="store_true",
+        help="Use the 19822 gateway approval queue instead of the legacy daemon",
+    )
     
     # init
     subparsers.add_parser("init", help="Initialize config directory（Default configuration）")
@@ -399,6 +563,17 @@ def main():
             cli.stop()
         elif args.action == "status":
             cli.status()
+
+    elif args.command == "gateway":
+        if args.action == "start":
+            cli.start_gateway(
+                save_logs=getattr(args, "save_logs", None),
+                log_dir=getattr(args, "log_dir", None),
+            )
+        elif args.action == "stop":
+            cli.stop_gateway()
+        elif args.action == "status":
+            cli.gateway_status()
     
     elif args.command == "panic":
         cli.panic(args.reason)
@@ -421,18 +596,19 @@ def main():
         cli.sanitize(args.text)
     
     elif args.command == "approval":
+        approval_base = cli._gateway_endpoint() if args.gateway else cli.api_url
         if args.action == "list":
-            cli.show_approvals()
+            cli.show_approvals(approval_base)
         elif args.action == "approve":
             if not args.id:
                 print("❌  ID: --id <id>")
                 sys.exit(1)
-            cli.approve(args.id, args.reason)
+            cli.approve(args.id, args.reason, approval_base)
         elif args.action == "deny":
             if not args.id:
                 print("❌  ID: --id <id>")
                 sys.exit(1)
-            cli.deny(args.id, args.reason)
+            cli.deny(args.id, args.reason, approval_base)
     
     elif args.command == "init":
         cli.init()

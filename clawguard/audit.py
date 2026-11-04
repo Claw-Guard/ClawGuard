@@ -25,6 +25,9 @@ class AuditAction(Enum):
     APPROVAL_APPROVE = "approval_approve"
     APPROVAL_DENY = "approval_deny"
     RULE_DENY = "rule_deny"
+    LLM_REQUEST = "llm_request"
+    LLM_RESPONSE = "llm_response"
+    MODEL_TOOL_CALL = "model_tool_call"
 
 
 class AuditResult(Enum):
@@ -106,7 +109,9 @@ class AuditLogger:
         self.retention_days = retention_days
         
         # Create directory if needed
-        os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
+        db_dir = os.path.dirname(self.db_path)
+        if db_dir:
+            os.makedirs(db_dir, exist_ok=True)
         
         # Initialize database
         self._init_db()
@@ -249,6 +254,7 @@ class AuditLogger:
         end_time: Optional[float] = None,
         limit: int = 100,
         offset: int = 0,
+        native_only: bool = False,
     ) -> List[AuditEntry]:
         """
         Query audit logs
@@ -261,6 +267,7 @@ class AuditLogger:
             end_time: End timestamp
             limit: Max results
             offset: Offset
+            native_only: Only native entries for the active Agent
             
         Returns:
             List of matched log entries
@@ -283,6 +290,16 @@ class AuditLogger:
         if end_time:
             conditions.append("timestamp <= ?")
             params.append(end_time)
+        if native_only:
+            # ``native_tool`` is stored in the JSON details payload so the
+            # existing audit schema remains backwards compatible.  Require
+            # the action explicitly as well: an unrelated event containing a
+            # similarly named detail must never appear in the native-tool UI.
+            conditions.append("action = 'model_tool_call'")
+            conditions.append(
+                "json_extract(CASE WHEN json_valid(details) THEN details ELSE '{}' END, "
+                "'$.native_tool') = 1"
+            )
         
         where_clause = " AND ".join(conditions) if conditions else "1=1"
         
@@ -312,54 +329,64 @@ class AuditLogger:
             agent_id=row["agent_id"],
         )
     
-    def get_stats(self, hours: int = 24) -> Dict[str, Any]:
+    def get_stats(self, hours: int = 24, native_only: bool = False) -> Dict[str, Any]:
         """
         Get statistics
         
         Args:
             hours: Time range in hours
+            native_only: Restrict statistics to native tool calls for the active Agent
             
         Returns:
             Statistics information
         """
         start_time = time.time() - (hours * 3600)
+
+        scope = "timestamp >= ?"
+        scope_params: List[Any] = [start_time]
+        if native_only:
+            scope += (
+                " AND action = 'model_tool_call' AND "
+                "json_extract(CASE WHEN json_valid(details) THEN details ELSE '{}' END, "
+                "'$.native_tool') = 1"
+            )
         
         with self._get_connection() as conn:
             # Total operations
             total = conn.execute(
-                "SELECT COUNT(*) FROM audit_log WHERE timestamp >= ?",
-                (start_time,)
+                f"SELECT COUNT(*) FROM audit_log WHERE {scope}",
+                scope_params,
             ).fetchone()[0]
             
             # By result
             by_result = conn.execute(
-                """
-                SELECT result, COUNT(*) as count 
-                FROM audit_log 
-                WHERE timestamp >= ?
+                f"""
+                SELECT result, COUNT(*) as count
+                FROM audit_log
+                WHERE {scope}
                 GROUP BY result
                 """,
-                (start_time,)
+                scope_params,
             ).fetchall()
             
             # By operation type
             by_action = conn.execute(
-                """
-                SELECT action, COUNT(*) as count 
-                FROM audit_log 
-                WHERE timestamp >= ?
+                f"""
+                SELECT action, COUNT(*) as count
+                FROM audit_log
+                WHERE {scope}
                 GROUP BY action
                 """,
-                (start_time,)
+                scope_params,
             ).fetchall()
             
             # Denied count
             denied = conn.execute(
-                """
-                SELECT COUNT(*) FROM audit_log 
-                WHERE timestamp >= ? AND result = 'denied'
+                f"""
+                SELECT COUNT(*) FROM audit_log
+                WHERE {scope} AND result = 'denied'
                 """,
-                (start_time,)
+                scope_params,
             ).fetchone()[0]
             
             return {
@@ -368,6 +395,7 @@ class AuditLogger:
                 "by_result": {row["result"]: row["count"] for row in by_result},
                 "by_action": {row["action"]: row["count"] for row in by_action},
                 "hours": hours,
+                "native_only": native_only,
             }
     
     def cleanup(self):

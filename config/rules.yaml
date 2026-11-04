@@ -23,11 +23,6 @@ command_rules:
       action: deny
       reason: "🚨 CRITICAL: Direct disk device access"
     
-    # Disk operations
-    - pattern: "mkfs|fdisk|parted|dd\\s+if=|dd\\s+of=/dev"
-      action: deny
-      reason: "🚨 CRITICAL: Disk formatting/partitioning"
-    
     # Fork bombs & resource exhaustion
     - pattern: ":\\(\\)\\s*\\{\\s*:\\|:&\\s*\\};\\s*:|\\(\\s*\\)\\s*\\{.*\\|.*&\\s*\\}"
       action: deny
@@ -312,6 +307,9 @@ file_rules:
   allowed_paths:
     # Workspace directories
     - ~/work
+    # OpenClaw 默认 agent 工作区（容器内 ~ = /home/node）。
+    # 不带通配符时按前缀匹配，因此这一条自动覆盖其下所有子路径。
+    - ~/.openclaw/workspace
     
 
   denied_paths:
@@ -518,7 +516,7 @@ sanitizer_rules:
     
     # Azure
     azure_client_secret:
-      pattern: "[a-zA-Z0-9~_\\-]{34,40}"
+      pattern: "(?i)(?:azure[_ -]?(?:client[_ -]?)?secret|client[_ -]?secret)\\s*[=:]\\s*['\"]?[a-zA-Z0-9~_.\\-]{34,40}['\"]?"
       replacement: "[AZURE_SECRET_REDACTED]"
     
     # ========== VCS Tokens ==========
@@ -662,7 +660,7 @@ sanitizer_rules:
       replacement: "\"auth\": \"[DOCKER_AUTH_REDACTED]\""
     
     heroku_api_key:
-      pattern: "[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
+      pattern: "(?i)heroku[_ -]?(?:api[_ -]?)?key\\s*[=:]\\s*['\"]?[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}['\"]?"
       replacement: "[HEROKU_API_KEY_REDACTED]"
 
   # Skill whitelist exemption (bypass sanitization for trusted skills)

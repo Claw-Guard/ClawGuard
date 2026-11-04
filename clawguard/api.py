@@ -5,7 +5,12 @@ FastAPI service providing REST API and SSE endpoints
 
 import os
 import asyncio
-from typing import Optional, Dict, Any
+import json
+import re
+import stat
+import tempfile
+import threading
+from typing import Optional, Dict, Any, Mapping
 from pathlib import Path
 
 import yaml
@@ -21,6 +26,7 @@ from .rules import RuleEngine, ActionType
 from .audit import AuditLogger, AuditAction, AuditResult
 from .approval import ApprovalQueue, ApprovalType, ApprovalStatus, ApprovalRequest
 from .panic import PanicManager, PanicTrigger
+from . import agent_adapters
 
 
 # ================================
@@ -29,6 +35,7 @@ from .panic import PanicManager, PanicTrigger
 
 class CommandRequest(BaseModel):
     command: str
+    cwd: Optional[str] = ""
     session_id: Optional[str] = ""
     agent_id: Optional[str] = ""
 
@@ -91,6 +98,7 @@ class ToolCallRequest(BaseModel):
 def create_app(
     config_path: Optional[str] = None,
     rules_path: Optional[str] = None,
+    settings: Optional[Any] = None,
 ) -> FastAPI:
     """
     Create FastAPI application
@@ -127,6 +135,367 @@ def create_app(
     if rules_path and os.path.exists(rules_path):
         with open(rules_path, 'r', encoding='utf-8') as f:
             rules_config = yaml.safe_load(f)
+
+    app.state.rules_path = (
+        os.path.abspath(os.path.expanduser(rules_path)) if rules_path else None
+    )
+    app.state.rules_write_lock = threading.Lock()
+
+    def persist_rule_change(
+        section: str,
+        key: str,
+        value: str,
+        *,
+        add: bool,
+    ) -> bool:
+        """Update one rule-list entry in rules.yaml atomically.
+
+        The edit is intentionally line-oriented so comments and unrelated
+        policy formatting are preserved.  The resulting document is parsed
+        before the atomic replace, and memory is updated by the caller only
+        after this function succeeds.
+        """
+        path = app.state.rules_path
+        if not path:
+            raise HTTPException(
+                status_code=500,
+                detail="Rules persistence is unavailable: rules_path is not configured",
+            )
+
+        def comparable(item: Any) -> str:
+            text = str(item)
+            return os.path.expanduser(text) if section == "file_rules" else text
+
+        with app.state.rules_write_lock:
+            try:
+                with open(path, "r", encoding="utf-8") as handle:
+                    original = handle.read()
+                lines = original.splitlines(keepends=True)
+            except OSError as exc:
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"Unable to read rules file: {exc}",
+                ) from exc
+
+            section_index = next(
+                (
+                    index
+                    for index, line in enumerate(lines)
+                    if line.rstrip() == f"{section}:"
+                ),
+                None,
+            )
+            if section_index is None:
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"Rules file has no {section} section",
+                )
+
+            section_end = len(lines)
+            for index in range(section_index + 1, len(lines)):
+                line = lines[index]
+                if (
+                    line.strip()
+                    and not line.lstrip().startswith("#")
+                    and len(line) - len(line.lstrip()) == 0
+                ):
+                    section_end = index
+                    break
+
+            key_index = next(
+                (
+                    index
+                    for index in range(section_index + 1, section_end)
+                    if lines[index].rstrip() == f"  {key}:"
+                ),
+                None,
+            )
+            if key_index is None:
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"Rules file has no {section}.{key} list",
+                )
+
+            key_end = section_end
+            for index in range(key_index + 1, section_end):
+                line = lines[index]
+                if (
+                    line.strip()
+                    and not line.lstrip().startswith("#")
+                    and len(line) - len(line.lstrip()) <= 2
+                ):
+                    key_end = index
+                    break
+
+            matching_index = None
+            for index in range(key_index + 1, key_end):
+                stripped = lines[index].strip()
+                if not stripped.startswith("- "):
+                    continue
+                try:
+                    item = yaml.safe_load(stripped[2:].strip())
+                except yaml.YAMLError:
+                    continue
+                if comparable(item) == value:
+                    matching_index = index
+                    break
+
+            if add and matching_index is None:
+                rendered = json.dumps(value, ensure_ascii=False)
+                lines.insert(key_index + 1, f"    - {rendered}\n")
+            elif not add and matching_index is not None:
+                lines.pop(matching_index)
+            else:
+                return False
+
+            updated = "".join(lines)
+            try:
+                parsed = yaml.safe_load(updated)
+                persisted_values = parsed[section][key]
+                if not isinstance(persisted_values, list):
+                    raise ValueError(f"{section}.{key} is not a list")
+            except (KeyError, TypeError, ValueError, yaml.YAMLError) as exc:
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"Refusing to persist invalid rules YAML: {exc}",
+                ) from exc
+
+            mode = stat.S_IMODE(os.stat(path).st_mode)
+            temp_path = None
+            try:
+                with tempfile.NamedTemporaryFile(
+                    mode="w",
+                    encoding="utf-8",
+                    newline="",
+                    dir=os.path.dirname(path),
+                    prefix=".rules.",
+                    suffix=".tmp",
+                    delete=False,
+                ) as handle:
+                    temp_path = handle.name
+                    handle.write(updated)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                os.chmod(temp_path, mode)
+                os.replace(temp_path, path)
+            except OSError as exc:
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"Unable to persist rules file: {exc}",
+                ) from exc
+            finally:
+                if temp_path and os.path.exists(temp_path):
+                    try:
+                        os.unlink(temp_path)
+                    except OSError:
+                        pass
+            return True
+
+    def persist_command_rule_change(
+        category: str,
+        pattern: str,
+        reason: str,
+        *,
+        add: bool,
+    ) -> bool:
+        """Add or remove one command rule while preserving YAML comments."""
+        path = app.state.rules_path
+        if not path:
+            raise HTTPException(
+                status_code=500,
+                detail="Rules persistence is unavailable: rules_path is not configured",
+            )
+
+        with app.state.rules_write_lock:
+            try:
+                with open(path, "r", encoding="utf-8") as handle:
+                    original = handle.read()
+                lines = original.splitlines(keepends=True)
+            except OSError as exc:
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"Unable to read rules file: {exc}",
+                ) from exc
+
+            section_index = next(
+                (
+                    index
+                    for index, line in enumerate(lines)
+                    if line.rstrip() == "command_rules:"
+                ),
+                None,
+            )
+            if section_index is None:
+                raise HTTPException(
+                    status_code=500,
+                    detail="Rules file has no command_rules section",
+                )
+
+            section_end = len(lines)
+            for index in range(section_index + 1, len(lines)):
+                line = lines[index]
+                if (
+                    line.strip()
+                    and not line.lstrip().startswith("#")
+                    and len(line) - len(line.lstrip()) == 0
+                ):
+                    section_end = index
+                    break
+
+            key_pattern = re.compile(
+                rf"^  {re.escape(category)}:\s*(.*?)\s*$"
+            )
+            key_match = None
+            key_index = None
+            for index in range(section_index + 1, section_end):
+                candidate = key_pattern.match(lines[index].rstrip("\r\n"))
+                if candidate:
+                    key_match = candidate
+                    key_index = index
+                    break
+            if key_index is None:
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"Rules file has no command_rules.{category} list",
+                )
+
+            key_end = section_end
+            for index in range(key_index + 1, section_end):
+                line = lines[index]
+                if (
+                    line.strip()
+                    and not line.lstrip().startswith("#")
+                    and len(line) - len(line.lstrip()) <= 2
+                ):
+                    key_end = index
+                    break
+
+            matching_index = None
+            for index in range(key_index + 1, key_end):
+                match = re.match(
+                    r"^\s{4}-\s+pattern:\s*(.*?)\s*$",
+                    lines[index],
+                )
+                if not match:
+                    continue
+                try:
+                    value = yaml.safe_load(match.group(1))
+                except yaml.YAMLError:
+                    continue
+                if value == pattern:
+                    matching_index = index
+                    break
+
+            if add and matching_index is None:
+                inline_value = key_match.group(1)
+                if inline_value:
+                    if inline_value not in {"[]", "null", "~"}:
+                        raise HTTPException(
+                            status_code=500,
+                            detail=(
+                                f"Unsupported inline command_rules.{category} "
+                                "value; use a YAML block list"
+                            ),
+                        )
+                    lines[key_index] = f"  {category}:\n"
+                insert_at = key_end
+                while insert_at > key_index + 1:
+                    previous = lines[insert_at - 1]
+                    if not previous.strip() or previous.lstrip().startswith("#"):
+                        insert_at -= 1
+                        continue
+                    break
+                rendered_pattern = json.dumps(pattern, ensure_ascii=False)
+                rendered_reason = json.dumps(reason, ensure_ascii=False)
+                rule_action = {
+                    "whitelist": "allow",
+                    "blacklist": "deny",
+                }[category]
+                lines[insert_at:insert_at] = [
+                    f"    - pattern: {rendered_pattern}\n",
+                    f"      action: {rule_action}\n",
+                    f"      reason: {rendered_reason}\n",
+                    "\n",
+                ]
+            elif not add and matching_index is not None:
+                remove_end = matching_index + 1
+                while remove_end < key_end:
+                    line = lines[remove_end]
+                    if not line.strip():
+                        break
+                    indentation = len(line) - len(line.lstrip())
+                    if (
+                        indentation <= 2
+                        or (indentation == 4 and line.lstrip().startswith("- "))
+                    ):
+                        break
+                    remove_end += 1
+                removed_count = remove_end - matching_index
+                lines[matching_index:remove_end] = []
+                key_end -= removed_count
+                if not any(
+                    re.match(
+                        r"^\s{4}-\s+pattern:\s*(.*?)\s*$",
+                        line,
+                    )
+                    for line in lines[key_index + 1:key_end]
+                ):
+                    lines[key_index] = f"  {category}: []\n"
+            else:
+                return False
+
+            updated = "".join(lines)
+            try:
+                parsed = yaml.safe_load(updated)
+                persisted_values = parsed["command_rules"][category]
+                if not isinstance(persisted_values, list):
+                    raise ValueError(
+                        f"command_rules.{category} is not a list"
+                    )
+                if not all(
+                    isinstance(item, Mapping)
+                    and isinstance(item.get("pattern"), str)
+                    for item in persisted_values
+                ):
+                    raise ValueError(
+                        f"command_rules.{category} contains an invalid rule"
+                    )
+            except (KeyError, TypeError, ValueError, yaml.YAMLError) as exc:
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"Refusing to persist invalid rules YAML: {exc}",
+                ) from exc
+
+            mode = stat.S_IMODE(os.stat(path).st_mode)
+            temp_path = None
+            try:
+                with tempfile.NamedTemporaryFile(
+                    mode="w",
+                    encoding="utf-8",
+                    newline="",
+                    dir=os.path.dirname(path),
+                    prefix=".rules.",
+                    suffix=".tmp",
+                    delete=False,
+                ) as handle:
+                    temp_path = handle.name
+                    handle.write(updated)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                os.chmod(temp_path, mode)
+                os.replace(temp_path, path)
+            except OSError as exc:
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"Unable to persist rules file: {exc}",
+                ) from exc
+            finally:
+                if temp_path and os.path.exists(temp_path):
+                    try:
+                        os.unlink(temp_path)
+                    except OSError:
+                        pass
+            return True
     
     # Initialize components
     app.state.sanitizer = Sanitizer(
@@ -134,14 +503,100 @@ def create_app(
         skill_whitelist=rules_config.get("sanitizer_rules", {}).get("skill_whitelist", []),
     )
     app.state.rules = RuleEngine(rules_config)
-    app.state.audit = AuditLogger(
-        db_path=config.get("audit", {}).get("db_path", "~/.clawguard/audit.db"),
+    if app.state.rules.policy_overlaps:
+        # An allow entry that overlaps a deny entry is dead policy: the deny
+        # entry always wins, so the user's intent cannot take effect.
+        print("⚠️  ClawGuard rules contain allow/deny overlaps (the deny entry always wins):")
+        for overlap in app.state.rules.policy_overlaps:
+            print(f"   - {overlap}")
+        print("   Remove the overlap from one of the two lists in rules.yaml.")
+    gateway_config = config.get("gateway", {}) if isinstance(config, dict) else {}
+    gateway_config = gateway_config if isinstance(gateway_config, dict) else {}
+    agent = agent_adapters.normalize_agent(
+        getattr(settings, "agent", None)
+        or os.environ.get("CLAWGUARD_AGENT")
+        or gateway_config.get("agent")
+        or "openclaw"
     )
+    data_dir = os.path.expanduser(
+        str(
+            getattr(settings, "data_dir", None)
+            or os.environ.get("CLAWGUARD_DATA_DIR")
+            or gateway_config.get("data_dir")
+            or gateway_config.get("dataDir")
+            or os.path.join("~/.clawguard", "agents", agent)
+        )
+    )
+    app.state.data_dir = data_dir
+    audit_config = config.get("audit", {}) if isinstance(config, dict) else {}
+    audit_config = audit_config if isinstance(audit_config, dict) else {}
+    app.state.audit = AuditLogger(
+        db_path=audit_config.get("db_path")
+        or os.path.join(data_dir, "audit.db"),
+    )
+    approval_config = config.get("approval", {}) if isinstance(config, dict) else {}
     app.state.approval = ApprovalQueue(
         timeout_seconds=config.get("policy", {}).get("approval_timeout", 60),
+        max_queue_size=approval_config.get("max_queue_size", 100),
+        db_path=approval_config.get("db_path")
+        or os.path.join(data_dir, "approval_history.db"),
     )
     app.state.timeout_action = config.get("policy", {}).get("timeout_action", "deny")
     app.state.panic = PanicManager()
+
+    def task_scope_status() -> Dict[str, Any]:
+        """Expose the latest active gateway session scope to the Dashboard."""
+        locked = bool(getattr(app.state.rules, "task_scope_locked", False))
+        gateway_scopes = getattr(app.state, "gateway_task_scopes", {})
+        active_scopes = [
+            state
+            for state in gateway_scopes.values()
+            if state.get("scope_ready") and isinstance(state.get("scope"), Mapping)
+        ] if isinstance(gateway_scopes, Mapping) else []
+        if active_scopes and not locked:
+            latest = max(active_scopes, key=lambda state: state.get("updated_at", 0))
+            return {
+                "active": True,
+                "locked": False,
+                "rules": dict(latest["scope"]),
+                "active_sessions": len(active_scopes),
+            }
+        return {
+            "active": bool(app.state.rules.task_scope_active) and not locked,
+            "locked": locked,
+            "rules": app.state.rules.task_scope_rules,
+            "active_sessions": 0,
+        }
+
+    async def clear_gateway_task_scopes(*, suppress_current_turn: bool) -> int:
+        gateway_scopes = getattr(app.state, "gateway_task_scopes", {})
+        session_locks = getattr(app.state, "gateway_session_locks", {})
+        if not isinstance(gateway_scopes, dict):
+            return 0
+        cleared = 0
+
+        def clear_state(state: Dict[str, Any]) -> None:
+            state["scope"] = None
+            state["scope_ready"] = False
+            state["scope_registry_digest"] = None
+            state["scope_suppressed_user_digest"] = (
+                state.get("user_digest") if suppress_current_turn else None
+            )
+
+        for session_id in list(gateway_scopes):
+            lock = session_locks.get(session_id) if isinstance(session_locks, dict) else None
+            if lock is None:
+                state = gateway_scopes.get(session_id)
+                if isinstance(state, dict):
+                    clear_state(state)
+                    cleared += 1
+                continue
+            async with lock:
+                state = gateway_scopes.get(session_id)
+                if isinstance(state, dict):
+                    clear_state(state)
+                    cleared += 1
+        return cleared
     
     # Set up approval resolution callback to log to audit
     async def on_approval_resolution(request: ApprovalRequest):
@@ -178,12 +633,12 @@ def create_app(
         # Try enhanced version first
         enhanced_path = dashboard_dir / "index-enhanced.html"
         if enhanced_path.exists():
-            return HTMLResponse(content=enhanced_path.read_text())
+            return HTMLResponse(content=enhanced_path.read_text(encoding="utf-8"))
         
         # Fallback to original
         index_path = dashboard_dir / "index.html"
         if index_path.exists():
-            return HTMLResponse(content=index_path.read_text())
+            return HTMLResponse(content=index_path.read_text(encoding="utf-8"))
         return HTMLResponse(content="<h1>Dashboard not found</h1>")
     
     @app.get("/static/css/style.css")
@@ -227,21 +682,29 @@ def create_app(
     @app.get("/status")
     async def status():
         """Get full status"""
+        gateway_settings = getattr(app.state, "gateway_settings", None)
         return {
+            "agent": getattr(gateway_settings, "agent", agent),
+            "upstream_format": getattr(
+                gateway_settings,
+                "upstream_format",
+                "openai_chat_completion",
+            ),
+            "data_dir": app.state.data_dir,
             "panic": app.state.panic.get_status(),
             "approval": app.state.approval.get_stats(),
             "audit": app.state.audit.get_stats(hours=24),
-            "task_scope": {
-                "active": app.state.rules.task_scope_active,
-                "locked": getattr(app.state.rules, "task_scope_locked", False),
-                "rules": app.state.rules.task_scope_rules,
-            },
+            # The Dashboard consumes this scoped view so LLM transport and
+            # approval bookkeeping do not appear as user-facing tool actions.
+            "native_tool_audit": app.state.audit.get_stats(hours=24, native_only=True),
+            "task_scope": task_scope_status(),
         }
     
     @app.get("/api/status")
     async def api_status():
-        """Get API status for OpenClaw plugin"""
+        """Get API status for local administration clients."""
         stats = app.state.audit.get_stats(hours=24)
+        gateway_settings = getattr(app.state, "gateway_settings", None)
         return {
             "version": "1.0.0",
             "mode": config.get("policy", {}).get("mode", "permissive"),
@@ -249,6 +712,16 @@ def create_app(
             "pid": os.getpid(),
             "audit_total": stats.get("total_operations", 0),
             "audit_denied": stats.get("denied_count", 0),
+            "responses_api": bool(
+                getattr(gateway_settings, "enable_responses_api", False)
+            ),
+            "agent": getattr(gateway_settings, "agent", agent),
+            "upstream_format": getattr(
+                gateway_settings,
+                "upstream_format",
+                "openai_chat_completion",
+            ),
+            "data_dir": app.state.data_dir,
         }
     
     # ================================
@@ -257,7 +730,7 @@ def create_app(
     
     @app.post("/api/tool/call")
     async def tool_call(request: ToolCallRequest):
-        """Handle tool calls from OpenClaw plugin"""
+        """Legacy local operation endpoint (not mounted by the LLM gateway)."""
         # Check panic first
         if app.state.panic.is_panicking:
             return {"error": "ClawGuard is in Panic mode"}
@@ -321,7 +794,10 @@ def create_app(
                 limit = params.get("limit", None)
 
                 import datetime, json as _json
-                _log_path = os.path.expanduser("~/.clawguard/read_debug.log")
+                _log_path = os.path.join(
+                    app.state.data_dir,
+                    "read_debug.log",
+                )
                 def _rlog(stage, **kw):
                     entry = {"ts": datetime.datetime.now().isoformat(), "stage": stage, "path": path, **kw}
                     with open(_log_path, "a") as _lf:
@@ -688,7 +1164,10 @@ def create_app(
                 }
             )
         
-        result = app.state.rules.check_command(request.command)
+        result = app.state.rules.check_command(
+            request.command,
+            cwd=request.cwd or None,
+        )
         
         # Log audit
         audit_result = AuditResult.ALLOWED if result.action == ActionType.ALLOW else AuditResult.DENIED
@@ -856,10 +1335,30 @@ def create_app(
         return {"status": "denied", "request": result.to_dict()}
     
     @app.get("/approval/history")
-    async def get_approval_history(limit: int = Query(50, ge=1, le=200)):
-        """Get approval history"""
+    async def get_approval_history(
+        limit: int = Query(50, ge=1, le=200),
+        offset: int = Query(0, ge=0),
+        include_previous_runs: bool = Query(False),
+    ):
+        """Get current-process or persistent approval history."""
+        if include_previous_runs:
+            history = app.state.approval.get_persisted_history(
+                limit=limit,
+                offset=offset,
+                include_previous_runs=True,
+            )
+            source = "persistent"
+        else:
+            history = [
+                request.to_dict()
+                for request in app.state.approval.get_history(limit)
+            ]
+            source = "current_process"
         return {
-            "history": [r.to_dict() for r in app.state.approval.get_history(limit)],
+            "history": history,
+            "source": source,
+            "boot_id": app.state.approval.boot_id,
+            "include_previous_runs": include_previous_runs,
         }
     
     @app.get("/approval/sse")
@@ -920,9 +1419,12 @@ def create_app(
     # ================================
     
     @app.get("/audit/stats")
-    async def get_audit_stats(hours: int = Query(24, ge=1, le=168)):
+    async def get_audit_stats(
+        hours: int = Query(24, ge=1, le=168),
+        native_only: bool = Query(False),
+    ):
         """Get audit statistics"""
-        return app.state.audit.get_stats(hours)
+        return app.state.audit.get_stats(hours, native_only=native_only)
     
     @app.get("/audit/logs")
     async def get_audit_logs(
@@ -930,16 +1432,24 @@ def create_app(
         offset: int = Query(0, ge=0),
         action: Optional[str] = None,
         result: Optional[str] = None,
+        native_only: bool = Query(False),
     ):
-        """Get audit logs"""
+        """Get audit logs.
+
+        ``native_only`` is used by the Dashboard to show only native model-tool
+        calls for the active Agent. Internal gateway events and plugin/MCP calls
+        remain available to backend audit consumers when it is false.
+        """
         logs = app.state.audit.query(
             action=action,
             result=result,
             limit=limit,
             offset=offset,
+            native_only=native_only,
         )
         return {
             "count": len(logs),
+            "native_only": native_only,
             "logs": [l.to_dict() for l in logs],
         }
     
@@ -950,6 +1460,7 @@ def create_app(
         action: Optional[str] = None,
         result: Optional[str] = None,
         session_id: Optional[str] = None,
+        native_only: bool = Query(False),
     ):
         """
         Download audit logs as JSON file
@@ -960,6 +1471,8 @@ def create_app(
         - action: Filter by action type (optional)
         - result: Filter by result (optional)
         - session_id: Filter by session ID (optional)
+        - native_only: Export only native model-tool calls for the active Agent
+          (optional)
         
         Returns:
         JSON file with filtered audit logs
@@ -977,6 +1490,7 @@ def create_app(
             end_time=end_time,
             limit=100000,  # High limit for export
             offset=0,
+            native_only=native_only,
         )
         
         # Convert to dict format
@@ -990,6 +1504,7 @@ def create_app(
                     "action": action,
                     "result": result,
                     "session_id": session_id,
+                    "native_only": native_only,
                 },
             },
             "logs": [l.to_dict() for l in logs],
@@ -1018,74 +1533,136 @@ def create_app(
     async def add_allowed_domain(domain: str):
         """Add domain to network whitelist"""
         if domain not in app.state.rules.network_rules["allowed_domains"]:
+            persist_rule_change(
+                "network_rules",
+                "allowed_domains",
+                domain,
+                add=True,
+            )
             app.state.rules.network_rules["allowed_domains"].append(domain)
-            return {"status": "added", "domain": domain}
-        return {"status": "already_exists", "domain": domain}
+            return {"status": "added", "domain": domain, "persisted": True}
+        return {"status": "already_exists", "domain": domain, "persisted": True}
     
     @app.post("/rules/network/deny")
     async def add_denied_domain(domain: str):
         """Add domain to network blacklist"""
         if domain not in app.state.rules.network_rules["denied_domains"]:
+            persist_rule_change(
+                "network_rules",
+                "denied_domains",
+                domain,
+                add=True,
+            )
             app.state.rules.network_rules["denied_domains"].append(domain)
-            return {"status": "added", "domain": domain}
-        return {"status": "already_exists", "domain": domain}
+            return {"status": "added", "domain": domain, "persisted": True}
+        return {"status": "already_exists", "domain": domain, "persisted": True}
     
     @app.post("/rules/file/allow")
     async def add_allowed_path(path: str):
         """Add path to file whitelist"""
         expanded = os.path.expanduser(path)
         if expanded not in app.state.rules.file_rules["allowed_paths"]:
+            persist_rule_change(
+                "file_rules",
+                "allowed_paths",
+                expanded,
+                add=True,
+            )
             app.state.rules.file_rules["allowed_paths"].append(expanded)
-            return {"status": "added", "path": expanded}
-        return {"status": "already_exists", "path": expanded}
+            return {"status": "added", "path": expanded, "persisted": True}
+        return {"status": "already_exists", "path": expanded, "persisted": True}
     
     @app.post("/rules/file/deny")
     async def add_denied_path(path: str):
         """Add path to file blacklist"""
         expanded = os.path.expanduser(path)
         if expanded not in app.state.rules.file_rules["denied_paths"]:
+            persist_rule_change(
+                "file_rules",
+                "denied_paths",
+                expanded,
+                add=True,
+            )
             app.state.rules.file_rules["denied_paths"].append(expanded)
-            return {"status": "added", "path": expanded}
-        return {"status": "already_exists", "path": expanded}
+            return {"status": "added", "path": expanded, "persisted": True}
+        return {"status": "already_exists", "path": expanded, "persisted": True}
     
     @app.delete("/rules/network/allow/{domain}")
     async def remove_allowed_domain(domain: str):
         """Remove domain from network whitelist"""
         if domain in app.state.rules.network_rules["allowed_domains"]:
+            persist_rule_change(
+                "network_rules",
+                "allowed_domains",
+                domain,
+                add=False,
+            )
             app.state.rules.network_rules["allowed_domains"].remove(domain)
-            return {"status": "removed", "domain": domain}
-        return {"status": "not_found", "domain": domain}
+            return {"status": "removed", "domain": domain, "persisted": True}
+        return {"status": "not_found", "domain": domain, "persisted": True}
     
     @app.delete("/rules/network/deny/{domain}")
     async def remove_denied_domain(domain: str):
         """Remove domain from network blacklist"""
         if domain in app.state.rules.network_rules["denied_domains"]:
+            persist_rule_change(
+                "network_rules",
+                "denied_domains",
+                domain,
+                add=False,
+            )
             app.state.rules.network_rules["denied_domains"].remove(domain)
-            return {"status": "removed", "domain": domain}
-        return {"status": "not_found", "domain": domain}
+            return {"status": "removed", "domain": domain, "persisted": True}
+        return {"status": "not_found", "domain": domain, "persisted": True}
     
     @app.delete("/rules/file/allow")
     async def remove_allowed_path(path: str):
         """Remove path from file whitelist"""
         expanded = os.path.expanduser(path)
         if expanded in app.state.rules.file_rules["allowed_paths"]:
+            persist_rule_change(
+                "file_rules",
+                "allowed_paths",
+                expanded,
+                add=False,
+            )
             app.state.rules.file_rules["allowed_paths"].remove(expanded)
-            return {"status": "removed", "path": expanded}
-        return {"status": "not_found", "path": expanded}
+            return {"status": "removed", "path": expanded, "persisted": True}
+        return {"status": "not_found", "path": expanded, "persisted": True}
     
     @app.delete("/rules/file/deny")
     async def remove_denied_path(path: str):
         """Remove path from file blacklist"""
         expanded = os.path.expanduser(path)
         if expanded in app.state.rules.file_rules["denied_paths"]:
+            persist_rule_change(
+                "file_rules",
+                "denied_paths",
+                expanded,
+                add=False,
+            )
             app.state.rules.file_rules["denied_paths"].remove(expanded)
-            return {"status": "removed", "path": expanded}
-        return {"status": "not_found", "path": expanded}
+            return {"status": "removed", "path": expanded, "persisted": True}
+        return {"status": "not_found", "path": expanded, "persisted": True}
     
     @app.get("/rules/list")
     async def list_rules():
         """Get current runtime rules including task scope"""
+        command_rule_groups = {
+            "allowed": "whitelist",
+            "denied": "blacklist",
+        }
         return {
+            "command": {
+                public_name: [
+                    {
+                        "pattern": rule["raw_pattern"],
+                        "reason": rule.get("reason", ""),
+                    }
+                    for rule in app.state.rules.command_rules[internal_name]
+                ]
+                for public_name, internal_name in command_rule_groups.items()
+            },
             "network": {
                 "allowed_domains": app.state.rules.network_rules["allowed_domains"],
                 "denied_domains": app.state.rules.network_rules["denied_domains"],
@@ -1095,14 +1672,129 @@ def create_app(
                 "denied_paths": app.state.rules.file_rules["denied_paths"],
             },
             "task_scope": {
-                "active": app.state.rules.task_scope_active,
-                "locked": getattr(app.state.rules, "task_scope_locked", False),
-                "rules": app.state.rules.task_scope_rules,
+                **task_scope_status(),
             },
         }
-    
+
+    COMMAND_RULE_CATEGORIES = {
+        "allow": "whitelist",
+        "whitelist": "whitelist",
+        "deny": "blacklist",
+        "blacklist": "blacklist",
+    }
+    COMMAND_RULE_ACTIONS = {
+        "whitelist": ActionType.ALLOW,
+        "blacklist": ActionType.DENY,
+    }
+    COMMAND_RULE_REASONS = {
+        "whitelist": "Command allowed from Dashboard",
+        "blacklist": "Command blocked from Dashboard",
+    }
+
+    def resolve_command_category(category: str) -> str:
+        resolved = COMMAND_RULE_CATEGORIES.get(category.strip().casefold())
+        if resolved is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Unknown command rule category: {category}",
+            )
+        return resolved
+
+    @app.post("/rules/command/{category}")
+    async def add_command_rule(
+        category: str,
+        pattern: str,
+        reason: str = "",
+    ):
+        """Add one command regex to the selected command rule list."""
+        canonical = resolve_command_category(category)
+        pattern = pattern.strip()
+        if not pattern:
+            raise HTTPException(status_code=400, detail="Command pattern is required")
+        if len(pattern) > 2048 or "\n" in pattern or "\r" in pattern:
+            raise HTTPException(
+                status_code=400,
+                detail="Command pattern must be a single line up to 2048 characters",
+            )
+        try:
+            compiled_pattern = re.compile(pattern)
+        except re.error as exc:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid command regex: {exc}",
+            ) from exc
+
+        existing = app.state.rules.command_rules[canonical]
+        if any(rule["raw_pattern"] == pattern for rule in existing):
+            return {
+                "status": "already_exists",
+                "category": category,
+                "pattern": pattern,
+                "persisted": True,
+            }
+
+        reason = reason.strip()[:512] or COMMAND_RULE_REASONS[canonical]
+        persist_command_rule_change(
+            canonical,
+            pattern,
+            reason,
+            add=True,
+        )
+        existing.append(
+            {
+                "pattern": compiled_pattern,
+                "action": COMMAND_RULE_ACTIONS[canonical],
+                "reason": reason,
+                "raw_pattern": pattern,
+            }
+        )
+        return {
+            "status": "added",
+            "category": category,
+            "pattern": pattern,
+            "persisted": True,
+        }
+
+    @app.delete("/rules/command/{category}")
+    async def remove_command_rule(category: str, pattern: str):
+        """Remove one exact command regex from the selected rule list."""
+        canonical = resolve_command_category(category)
+        existing = app.state.rules.command_rules[canonical]
+        matching = next(
+            (
+                rule
+                for rule in existing
+                if rule["raw_pattern"] == pattern
+            ),
+            None,
+        )
+        if matching is None:
+            return {
+                "status": "not_found",
+                "category": category,
+                "pattern": pattern,
+                "persisted": True,
+            }
+
+        persist_command_rule_change(
+            canonical,
+            pattern,
+            matching.get("reason", ""),
+            add=False,
+        )
+        existing.remove(matching)
+        return {
+            "status": "removed",
+            "category": category,
+            "pattern": pattern,
+            "persisted": True,
+        }
+
     @app.post("/task-scope/lock")
     async def lock_task_scope():
+        # Locking only changes which policy view is active.  Keep per-session
+        # scopes dormant so unlocking can resume the same turn without another
+        # task-scope planner request.
         return app.state.rules.lock_task_scope()
     
     @app.post("/task-scope/unlock")
@@ -1111,7 +1803,11 @@ def create_app(
     
     @app.post("/task-scope/clear")
     async def clear_task_scope_route():
-        return app.state.rules.clear_task_scope()
+        result = app.state.rules.clear_task_scope()
+        result["gateway_sessions_cleared"] = await clear_gateway_task_scopes(
+            suppress_current_turn=True
+        )
+        return result
 
     return app
 

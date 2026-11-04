@@ -67,22 +67,24 @@ async function updateStatus() {
 
     // Panic status
     panicMode = data.panic?.state === 'panic';
+    const agentLabel = String(data.agent || 'openclaw').toUpperCase();
+    statusBadge.title = `Agent: ${agentLabel}\nUpstream: ${data.upstream_format || 'unknown'}\nData: ${data.data_dir || 'unknown'}`;
     
     if (panicMode) {
         statusBadge.classList.add('panic');
-        statusBadge.querySelector('.status-text').textContent = 'PANIC';
+        statusBadge.querySelector('.status-text').textContent = `${agentLabel} · PANIC`;
         panicBanner.classList.remove('hidden');
         if (data.panic?.current_panic?.reason) {
             panicReason.textContent = data.panic.current_panic.reason;
         }
     } else {
         statusBadge.classList.remove('panic');
-        statusBadge.querySelector('.status-text').textContent = 'Normal';
+        statusBadge.querySelector('.status-text').textContent = `${agentLabel} · Normal`;
         panicBanner.classList.add('hidden');
     }
 
     // Audit stats
-    const audit = data.audit || {};
+    const audit = data.native_tool_audit || data.audit || {};
     statTotal.textContent = audit.total_operations || 0;
     statBlocked.textContent = audit.denied_count || 0;
     
@@ -122,15 +124,16 @@ async function loadApprovalQueue() {
 
 // Load Audit Log
 async function loadAuditLog() {
-    const data = await apiGet('/audit/logs?limit=50');
+    const data = await apiGet('/audit/logs?limit=50&action=model_tool_call&native_only=true');
     if (!data || !data.logs) return;
 
     auditLogBody.innerHTML = data.logs.map(log => `
         <tr>
             <td>${formatTime(log.timestamp)}</td>
-            <td>${log.action}</td>
+            <td>model_tool_call</td>
             <td class="result-${log.result}">${log.result}</td>
-            <td>${escapeHtml(truncate(log.operation, 40))}</td>
+            <td>${escapeHtml(truncate(auditOperation(log), 40))}</td>
+            <td>${escapeHtml(truncate(auditTarget(log), 40) || '-')}</td>
             <td>${escapeHtml(truncate(log.reason || '', 30))}</td>
         </tr>
     `).join('');
@@ -197,6 +200,25 @@ async function checkCommand() {
 }
 
 // Helpers
+// 审计表里的"目标"列：域名/路径由后端写在 details.target 上。
+function auditTarget(log) {
+    try {
+        const details = typeof log.details === 'string' ? JSON.parse(log.details) : (log.details || {});
+        return details.target || '';
+    } catch (err) {
+        return '';
+    }
+}
+
+function auditOperation(log) {
+    try {
+        const details = typeof log.details === 'string' ? JSON.parse(log.details) : (log.details || {});
+        return details.display_operation || log.operation || '';
+    } catch (err) {
+        return log.operation || '';
+    }
+}
+
 function escapeHtml(text) {
     if (!text) return '';
     const div = document.createElement('div');
@@ -254,9 +276,9 @@ async function init() {
     await loadAuditLog();
     connectSSE();
 
-    // Refresh periodically
-    setInterval(updateStatus, 30000);
-    setInterval(loadAuditLog, 60000);
+    // Refresh periodically so new decisions appear without a manual reload.
+    setInterval(updateStatus, 5000);
+    setInterval(loadAuditLog, 5000);
 }
 
 init();

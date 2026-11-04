@@ -4,9 +4,48 @@
 daemon:
   api_port: 19821
   web_port: 19821
-  ws_port: 19822
+  ws_port: 19823
   log_level: info
   pid_file: ~/.clawguard/daemon.pid
+
+# Transparent OpenAI-compatible LLM gateway.  Point OpenClaw's
+# models.providers.<name>.baseUrl at http://127.0.0.1:19822/v1; keep the real
+# provider URL and key here (or provide them through environment variables).
+gateway:
+  host: 127.0.0.1
+  port: 19822
+  # Agent adapter: openclaw | codex | claude. This selects tool-name semantics
+  # and Skill discovery roots without changing the shared policy backend.
+  agent: codex
+  # Agent-isolated runtime state root. Empty derives
+  # ~/.clawguard/agents/<agent> for every agent. Configuration and rules stay
+  # under ~/.clawguard/config.yaml and ~/.clawguard/rules.yaml.
+  data_dir: null
+  upstream_base_url: https://api.openai.com/v1
+  # Upstream wire protocol: openai_response | openai_chat_completion | anthropic_message.
+  # DeepSeek Anthropic-compatible base URL: https://api.deepseek.com/anthropic
+  upstream_format: openai_response
+  # Opt-in OpenAI Responses compatibility. When enabled, OpenClaw can use
+  # api: openai-responses and baseUrl http://127.0.0.1:19822/v1. The existing
+  # /v1/chat/completions route remains enabled and unchanged.
+  enable_responses_api: true
+  upstream_api_key: null
+  client_api_key: null
+  forward_client_authorization: true
+  timeout_seconds: 120
+  # deny = fail closed for a model call not declared in the current request;
+  # approve/allow are available for provider-side tools when explicitly needed.
+  unknown_tool_action: deny
+  # Opaque registered tools are approval-gated unless explicitly set to allow.
+  unclassified_tool_action: approve
+  # permissive keeps approval-required operations non-blocking but still
+  # preserves explicit deny rules. Use supervised or strict for stronger mode.
+  policy_mode: supervised
+  # Save every request forwarded to the upstream provider as timestamped
+  # JSON + plain-text files in log_dir. The CLI flags `gateway start
+  # --save-logs/--no-save-logs` override this for a single run.
+  request_logging: false
+  log_dir: null
 
 mcp:
   transport: stdio
@@ -20,12 +59,34 @@ policy:
   hot_reload: true
 
 audit:
-  db_path: ~/.clawguard/audit.db
+  db_path: null
   max_size_mb: 500
   retention_days: 90
 
+# Skill Inspector watches Skill lifecycle tool calls at the API gateway.  It
+# stores content-addressed verdicts separately from audit history and does not
+# change the Chat Completions request/response protocol.
+skill_inspector:
+  enabled: true
+  roots:
+    - ~/.openclaw/workspace/skills
+    - ~/.openclaw/skills
+    - ~/.openclaw/plugin-skills
+    - ~/.agents/skills
+    - ~/.claude/skills
+  db_path: null
+  # Empty uses /opt/clawguard/config/prompts/skill_judge.md in the image.
+  judge_template: null
+  # Empty uses the model from the intercepted Chat Completions request.
+  judge_model: null
+  max_files: 256
+  max_file_bytes: 262144
+  max_total_bytes: 1048576
+
 sanitizer:
   enabled: true
+  # Input detection remains available for audit and internal planning, while
+  # ordinary forwarded conversation history remains unchanged.
   input_sanitization: true
   output_sanitization: true
   skill_whitelist: []
