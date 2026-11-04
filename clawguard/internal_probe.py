@@ -19,7 +19,7 @@ from .gateway import (
     _scope_planning_payload,
     _upstream_url,
 )
-from .upstreams import ANTHROPIC_MESSAGE, OPENAI_RESPONSE
+from .adapters.upstreams import ANTHROPIC_MESSAGE, OPENAI_RESPONSE
 
 
 def _client_protocol(upstream_format: str) -> str:

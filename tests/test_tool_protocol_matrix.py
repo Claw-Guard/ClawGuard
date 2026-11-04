@@ -12,7 +12,7 @@ from clawguard.gateway import (
     evaluate_tool_call,
 )
 from clawguard.rules import ActionType, RuleEngine
-from clawguard.tool_protocol import CanonicalToolCall, PolicyDecision
+from clawguard.adapters.tool_protocol import CanonicalToolCall, PolicyDecision
 
 
 def main():

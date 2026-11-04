@@ -1,4 +1,4 @@
-from clawguard import responses
+from clawguard.adapters import responses
 from clawguard.sanitizer import Sanitizer
 from clawguard.gateway import _sanitize_json_value
 

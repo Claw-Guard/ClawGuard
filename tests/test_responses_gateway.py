@@ -6,7 +6,7 @@ import httpx
 import yaml
 
 import clawguard.gateway as gateway
-from clawguard.responses import (
+from clawguard.adapters.responses import (
     extract_responses_stream_tool_calls,
     extract_responses_tool_calls,
 )
@@ -942,7 +942,7 @@ def test_responses_custom_tool_call_preserves_freeform_input():
 
 
 def test_codex_custom_apply_patch_path_is_discovered_for_scope_checks():
-    from clawguard import agent_adapters
+    from clawguard.adapters import agent_adapters
 
     rules = gateway.RuleEngine()
     rules.set_task_scope(

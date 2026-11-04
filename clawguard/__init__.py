@@ -13,7 +13,7 @@ from clawguard.approval import ApprovalQueue
 from clawguard.panic import PanicManager
 from clawguard.skill_check import SkillChecker
 from clawguard.script_analyzer import ScriptAnalyzer, ScriptAnalysisResult, ScriptRisk
-from clawguard.tool_protocol import CanonicalToolCall, PolicyDecision, ToolCallFacts
+from clawguard.adapters.tool_protocol import CanonicalToolCall, PolicyDecision, ToolCallFacts
 from clawguard.skill_inspector import (
     SkillBundle,
     SkillInspector,

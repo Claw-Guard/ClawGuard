@@ -26,7 +26,7 @@ from .rules import RuleEngine, ActionType
 from .audit import AuditLogger, AuditAction, AuditResult
 from .approval import ApprovalQueue, ApprovalType, ApprovalStatus, ApprovalRequest
 from .panic import PanicManager, PanicTrigger
-from . import agent_adapters
+from .adapters import agent_adapters
 
 
 # ================================

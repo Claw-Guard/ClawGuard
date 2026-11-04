@@ -4,7 +4,7 @@ from pathlib import Path
 import pytest
 import yaml
 
-from clawguard import agent_adapters
+from clawguard.adapters import agent_adapters
 from clawguard.gateway import (
     GatewaySettings,
     _augment_scope_for_agent_web_research,

@@ -40,11 +40,17 @@ import yaml
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response
 
-from . import agent_adapters
-from . import anthropic as anthropic_protocol
+from .adapters import agent_adapters
+from .adapters import anthropic as anthropic_protocol
+from .adapters import responses as responses_protocol
+from .adapters import upstreams
+from .adapters.tool_protocol import (
+    CanonicalToolCall,
+    PolicyDecision,
+    ToolCallFacts,
+    arguments_object,
+)
 from . import internal_requests
-from . import responses as responses_protocol
-from . import upstreams
 from .api import create_app
 from .audit import AuditAction, AuditResult
 from .approval import ApprovalType
@@ -56,12 +62,6 @@ from .skill_inspector import (
     SkillReviewStore,
     SkillVerdict,
     parse_judge_verdict,
-)
-from .tool_protocol import (
-    CanonicalToolCall,
-    PolicyDecision,
-    ToolCallFacts,
-    arguments_object,
 )
 
 
